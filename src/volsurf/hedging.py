@@ -905,7 +905,9 @@ def stride_ladder(y, predictors, subsamples):
         One row per predictor. n_offset0 is the number of windows in
         subsample 0; for each statistic s in r2_45, r2_ols and beta (the
         r2_ladder columns), s_offset0 is its value on subsample 0 and s_median, s_min
-        and s_max summarise it across all subsamples. No bootstrap.
+        and s_max summarise it across all subsamples. No bootstrap: the
+        subsamples interleave the same months, so their range measures
+        sensitivity to window alignment, not a sampling distribution.
     """
     y = np.asarray(y, dtype=float)
     predictors = {name: np.asarray(p, dtype=float) for name, p in predictors.items()}
