@@ -106,7 +106,7 @@ def _fetch_chain(ticker: str) -> tuple[float, float, pd.DataFrame]:
 def main() -> None:
     if not is_market_hours():
         print(
-            "Outside market hours (weekdays 09:30–16:00 America/New_York). Aborting.",
+            "Outside market hours (weekdays 09:30 to 16:00 America/New_York). Aborting.",
             file=sys.stderr,
         )
         sys.exit(1)
