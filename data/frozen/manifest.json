@@ -1,0 +1,16 @@
+{
+  "utc_timestamp": "2026-09-30T02:46:11.674766+00:00",
+  "tickers": [
+    "SPY",
+    "^VIX",
+    "^IRX"
+  ],
+  "yfinance_version": "1.7.0",
+  "start_date": "2021-06-01",
+  "end_date": "2026-09-29",
+  "row_count": 1339,
+  "ffill_counts": {
+    "sigma_i": 0,
+    "r": 0
+  }
+}
