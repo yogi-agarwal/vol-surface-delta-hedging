@@ -31,7 +31,8 @@ SEED_DRIFT = 2  # drift r = 0.04 paths for the carry check
 SEED_SET_VOLS = 3  # sigma_i and sigma_true draws for the synthetic window set
 SEED_SET_PATHS = 4  # paths for the synthetic window set
 
-FIELDS = [f for f in HedgeResult._fields if f != "n_intervals"]
+INTERVAL_FIELDS = ["interval_pnl", "interval_p_step"]
+FIELDS = [f for f in HedgeResult._fields if f not in ["n_intervals", *INTERVAL_FIELDS]]
 
 
 @pytest.fixture(scope="module")
@@ -125,14 +126,23 @@ def _reference_window(S, t, r, sigma, K, h, c, q, is_call=True):
 
     r holds one rate per step. The premium is carried to expiry in its own
     account, so financing is the interest on the hedge cash alone, and every
-    result is divided by that carried premium.
+    result is divided by that carried premium. Interval P&L comes from marking
+    the whole position (option at its Black-Scholes value, stock, cash, less
+    the carried premium) just before each rebalance and carrying the mark to
+    expiry.
     """
     n = len(S) - 1
     expiry = t[-1]
+
+    def to_expiry(a):
+        """Growth of one unit of cash from close a to close n, day by day."""
+        return math.prod(math.exp(r[j] * (t[j + 1] - t[j])) for j in range(a, n))
+
     c0 = bs_price(S[0], K, expiry - t[0], r[0], q, sigma, is_call)
     premium, cash, position = c0, 0.0, 0.0
     stock = financing = costs = turnover = 0.0
-    set_days = []
+    set_days, marks = [], []
+    payoff = max(S[n] - K, 0.0) if is_call else max(K - S[n], 0.0)
     for j in range(n + 1):
         if j > 0:
             step_growth = math.exp(r[j - 1] * (t[j] - t[j - 1]))
@@ -146,6 +156,8 @@ def _reference_window(S, t, r, sigma, K, h, c, q, is_call=True):
         elif j == 0 or (n - j) % h == 0:
             target = -bs_delta(S[j], K, expiry - t[j], r[j], q, sigma, is_call)
             set_days.append(j)
+            option = bs_price(S[j], K, expiry - t[j], r[j], q, sigma, is_call)
+            marks.append(to_expiry(j) * (option + position * S[j] + cash - premium))
         else:
             target = position
         trade = target - position
@@ -155,25 +167,25 @@ def _reference_window(S, t, r, sigma, K, h, c, q, is_call=True):
         cash -= trade * S[j] + cost
         costs -= cost
         position = target
-    payoff = max(S[n] - K, 0.0) if is_call else max(K - S[n], 0.0)
     pnl = cash + payoff - premium
-
-    def to_expiry(a):
-        """Growth of one unit of cash from close a to close n, day by day."""
-        return math.prod(math.exp(r[j] * (t[j + 1] - t[j])) for j in range(a, n))
+    interval_pnl = np.diff(marks + [pnl])
 
     rv = sum(math.log(S[j + 1] / S[j]) ** 2 for j in range(n))
     var_gap = rv / (expiry - t[0]) - sigma**2
     ends = set_days[1:] + [n]
     p_path = p_step = 0.0
+    interval_p_step = []
     for a, b in zip(set_days, ends):
         dollar_gamma = to_expiry(a) * bs_gamma(S[a], K, expiry - t[a], r[a], q, sigma) * S[a] ** 2
         dt = t[b] - t[a]
         p_path += 0.5 * var_gap * dollar_gamma * dt
-        p_step += 0.5 * dollar_gamma * ((S[b] / S[a] - 1.0) ** 2 - sigma**2 * dt)
+        interval_p_step.append(0.5 * dollar_gamma * ((S[b] / S[a] - 1.0) ** 2 - sigma**2 * dt))
+        p_step += interval_p_step[-1]
     vega0 = bs_vega(S[0], K, expiry - t[0], r[0], q, sigma)
     p_gap = to_expiry(0) * vega0 * var_gap / (2 * sigma)
     return {
+        "interval_pnl": interval_pnl / premium,
+        "interval_p_step": np.array(interval_p_step) / premium,
         "pnl": pnl / premium,
         "payoff": payoff / premium,
         "stock": stock / premium,
@@ -211,8 +223,26 @@ def test_matches_reference_loop(uneven_window, h, is_call):
     assert res.n_intervals == hedge_grid(len(t) - 1, h).size - 1
     for i in range(S.shape[0]):
         ref = _reference_window(S[i], t, r, sigma[i], K[i], h, c, q[i], is_call)
+        for name in INTERVAL_FIELDS:
+            # The reference differences marks of the whole position (stock and cash included), so
+            # its rounding grows with the position relative to the premium (intervals reach 30
+            # premiums on the cheap out-of-the-money put): relative 1e-12 as for the other
+            # fields, with a floor of 1e-12 of the premium for intervals near zero.
+            value = ref.pop(name)
+            assert getattr(res, name)[i].shape == (res.n_intervals,)
+            np.testing.assert_allclose(getattr(res, name)[i], value, rtol=1e-12, atol=1e-12, err_msg=name)
         for name, value in ref.items():
             assert getattr(res, name)[i] == pytest.approx(value, rel=1e-12, abs=1e-14), name
+
+
+@pytest.mark.parametrize("is_call", [True, False])
+@pytest.mark.parametrize("h", [1, 3, 10])
+def test_intervals_sum_to_window(uneven_window, h, is_call):
+    S, t, r, sigma, K, q = uneven_window
+    res = simulate_window(S, t, r, sigma, K, h=h, c=0.001, q=q, is_call=is_call)
+    assert res.interval_pnl.shape == res.interval_p_step.shape == (5, res.n_intervals)
+    np.testing.assert_allclose(res.interval_pnl.sum(axis=-1), res.pnl, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(res.interval_p_step.sum(axis=-1), res.p_step, rtol=0, atol=1e-12)
 
 
 def test_components_sum_to_pnl(uneven_window):
@@ -230,6 +260,9 @@ def test_broadcasting_matches_single_path(uneven_window):
     for name in ("pnl", "stock", "financing", "costs", "turnover", "p_gap", "p_path", "p_step"):
         assert np.ndim(getattr(one, name)) == 0
         assert getattr(res, name)[3] == pytest.approx(getattr(one, name), rel=1e-14, abs=1e-15)
+    for name in INTERVAL_FIELDS:
+        assert getattr(one, name).shape == (one.n_intervals,)
+        np.testing.assert_allclose(getattr(res, name)[3], getattr(one, name), rtol=1e-14, atol=1e-15)
 
 
 def test_static_hedge_has_no_interior_turnover(uneven_window):
@@ -257,7 +290,7 @@ def test_per_window_times_and_rates(uneven_window):
     res = simulate_window(S, times, rates, sigma, K, h=3, c=0.0005, q=q)
     for i in range(5):
         one = simulate_window(S[i], times[i], rates[i], sigma[i], K[i], h=3, c=0.0005, q=q[i])
-        for name in FIELDS:
+        for name in FIELDS + INTERVAL_FIELDS:
             assert getattr(res, name)[i] == pytest.approx(getattr(one, name), rel=1e-14, abs=1e-15), name
 
 
@@ -298,6 +331,8 @@ def test_simulate_windows_groups_by_length(uneven_window):
     q = 0.013
     res = simulate_windows(history, t, rates, starts, ends, sigma, K, h=2, c=0.001, q=q)
     assert res.pnl.shape == (5,)
+    n_max = 4  # ceil(7/2) for the longest window
+    assert res.interval_pnl.shape == res.interval_p_step.shape == (5, n_max)
     for w, (a, b) in enumerate(zip(starts, ends)):
         one = simulate_window(
             history[a : b + 1], t[a : b + 1], rates[a:b], sigma[w], K[w], h=2, c=0.001, q=q
@@ -305,6 +340,14 @@ def test_simulate_windows_groups_by_length(uneven_window):
         assert res.n_intervals[w] == one.n_intervals
         for name in FIELDS:
             assert getattr(res, name)[w] == pytest.approx(getattr(one, name), rel=1e-14, abs=1e-15), name
+        # Interval columns are aligned at expiry and NaN before the window's first interval.
+        pad = n_max - one.n_intervals
+        for name in INTERVAL_FIELDS:
+            assert np.isnan(getattr(res, name)[w, :pad]).all()
+            np.testing.assert_allclose(getattr(res, name)[w, pad:], getattr(one, name), rtol=1e-14, atol=1e-15)
+        # Column j ends at close ends[w] - (n_max - 1 - j)·h, as documented.
+        documented_ends = b - (n_max - 1 - np.arange(pad, n_max)) * 2
+        np.testing.assert_array_equal(documented_ends, a + hedge_grid(b - a, 2)[1:])
 
 
 @pytest.mark.parametrize(

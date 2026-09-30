@@ -11,7 +11,9 @@ prices and hedges at close j and accrues cash from close j to close j + 1.
 Money units: every quantity is measured at the t_n close (expiry money) and
 divided by C0·G_0, the premium carried to expiry, where G_j is the growth of
 one unit of cash from close j to close n at the step rates. Predictor terms of
-the hedge interval that starts at close k are weighted by G_k.
+the hedge interval that starts at close k are weighted by G_k. The P&L is also
+split by hedge interval, marking the option at its Black-Scholes value on each
+grid close, and the interval P&Ls sum to the window P&L exactly.
 
 The path is treated as a total-return series: no dividend cash flows are
 credited or charged. A dividend yield q, if given, enters pricing and Greeks
@@ -62,6 +64,15 @@ class HedgeResult(NamedTuple):
         Gamma-path predictor ½·(sigma_r² - sigma_i²)·sum_k G_k·Gamma_k·S_k²·dt_k.
     p_step : ndarray
         Step predictor sum_k ½·G_k·Gamma_k·S_k²·(R_k² - sigma_i²·dt_k).
+    interval_pnl : ndarray, trailing axis of length N
+        Hedged P&L of each hedge interval a -> b:
+        G_b·V_b - G_a·V_a - Delta_a·(G_b·S_b - G_a·S_a) + G_a·cost_a, where V
+        is the Black-Scholes value at sigma_i, r_a and the remaining time
+        (V_n is the payoff) and cost_a <= 0 is the cost of the trade at a; the
+        last interval also carries the unwind cost. Sums to pnl.
+    interval_p_step : ndarray, trailing axis of length N
+        The P_step term of each interval, ½·G_a·Gamma_a·S_a²·(R² - sigma_i²·dt).
+        Sums to p_step.
     rv : ndarray
         Realised total variance sum_j ln(S_{j+1}/S_j)² over daily closes
         (not annualised).
@@ -82,12 +93,15 @@ class HedgeResult(NamedTuple):
     p_gap: np.ndarray
     p_path: np.ndarray
     p_step: np.ndarray
+    interval_pnl: np.ndarray
+    interval_p_step: np.ndarray
     rv: np.ndarray
     c0: np.ndarray
     n_intervals: int | np.ndarray
 
 
-_FIELDS = tuple(f for f in HedgeResult._fields if f != "n_intervals")
+_INTERVAL_FIELDS = ("interval_pnl", "interval_p_step")
+_FIELDS = tuple(f for f in HedgeResult._fields if f not in _INTERVAL_FIELDS + ("n_intervals",))
 
 
 def gbm_paths(S0, mu, sigma, t, n_paths, seed):
@@ -247,9 +261,12 @@ def simulate_window(S, t, r, sigma_i, K, h, c, q=0.0, is_call=True):
     HedgeResult
         P&L, its components and the three predictors, each in expiry money
         as a fraction of C0·G_0 with shape () or (P,), plus turnover, rv, c0
-        and N. Delta and Gamma at close k use sigma_i, rate r_k and remaining
-        time t_n - t_k; R_k = S_{k+1}/S_k - 1 and dt_k = t_{k+1} - t_k run
-        over the hedge grid, and sigma_r² = rv/T0.
+        and N. interval_pnl and interval_p_step have shape () + (N,) or
+        (P, N), interval k running from grid close k to grid close k + 1 of
+        hedge_grid(n, h). Delta, Gamma and the option mark at close k use
+        sigma_i, rate r_k and remaining time t_n - t_k; R_k = S_{k+1}/S_k - 1
+        and dt_k = t_{k+1} - t_k run over the hedge grid, and
+        sigma_r² = rv/T0.
 
     Raises
     ------
@@ -274,6 +291,7 @@ def simulate_window(S, t, r, sigma_i, K, h, c, q=0.0, is_call=True):
     S_set, tau_set, r_set = S_g[..., :-1], tau[..., set_closes], r[..., set_closes]
     delta = bs_delta(S_set, strike, tau_set, r_set, div, sig, is_call)
     gamma = bs_gamma(S_set, strike, tau_set, r_set, div, sig)
+    value = bs_price(S_set, strike, tau_set, r_set, div, sig, is_call)  # option marks; value[..., 0] is C0
     c0 = bs_price(S[..., 0], K, T0, r[..., 0], q, sigma_i, is_call)
     vega0 = bs_vega(S[..., 0], K, T0, r[..., 0], q, sigma_i)
 
@@ -281,7 +299,7 @@ def simulate_window(S, t, r, sigma_i, K, h, c, q=0.0, is_call=True):
     log_growth = r * np.diff(t, axis=-1)
     tail = np.cumsum(log_growth[..., ::-1], axis=-1)[..., ::-1]
     growth = np.exp(np.concatenate([tail, np.zeros(lead + (1,))], axis=-1))
-    g0, g_set = growth[..., 0], growth[..., set_closes]
+    g0, g_set, g_grid = growth[..., 0], growth[..., set_closes], growth[..., grid]
     unit = c0 * g0
 
     # Stock position -Delta_k after each grid close, 0 after the unwind.
@@ -293,10 +311,23 @@ def simulate_window(S, t, r, sigma_i, K, h, c, q=0.0, is_call=True):
     stock = -np.sum(delta * np.diff(S_g, axis=-1), axis=-1)  # = -sum(trade·S_g)
     costs = np.sum(cost_flow, axis=-1)
     flow = -trade * S_g + cost_flow  # cash in at each grid close
-    financing = np.sum(flow * (growth[..., grid] - 1.0), axis=-1)
+    financing = np.sum(flow * (g_grid - 1.0), axis=-1)
 
     pnl = payoff - unit + stock + financing + costs
     turnover = np.sum(np.abs(trade[..., 1:-1]), axis=-1)
+
+    # P&L by interval in expiry money. Cash held over an interval keeps its expiry value, so
+    # only the option mark, the hedge and the cost of the opening trade change it; the last
+    # interval also pays the unwind cost. The marks telescope from C0·G_0 to the payoff.
+    value_end = np.concatenate([value[..., 1:], payoff[..., None]], axis=-1)
+    carried_cost = cost_flow * g_grid
+    interval_pnl = (
+        g_grid[..., 1:] * value_end
+        - g_set * value
+        - delta * (g_grid[..., 1:] * S_g[..., 1:] - g_set * S_set)
+        + carried_cost[..., :-1]
+    )
+    interval_pnl[..., -1] += carried_cost[..., -1]
 
     # Predictors on the hedge grid, each term carried to expiry.
     rv = np.sum(np.diff(np.log(S), axis=-1) ** 2, axis=-1)
@@ -306,7 +337,9 @@ def simulate_window(S, t, r, sigma_i, K, h, c, q=0.0, is_call=True):
     dollar_gamma = g_set * gamma * S_set**2
     p_gap = g0 * vega0 * var_gap / (2.0 * sigma_i)
     p_path = 0.5 * var_gap * np.sum(dollar_gamma * dt_g, axis=-1)
-    p_step = 0.5 * np.sum(dollar_gamma * (ret_g**2 - sig**2 * dt_g), axis=-1)
+    interval_p_step = 0.5 * dollar_gamma * (ret_g**2 - sig**2 * dt_g)
+    p_step = np.sum(interval_p_step, axis=-1)
+    unit_k = np.asarray(unit)[..., None]
 
     return HedgeResult(
         pnl=pnl / unit,
@@ -319,6 +352,8 @@ def simulate_window(S, t, r, sigma_i, K, h, c, q=0.0, is_call=True):
         p_gap=p_gap / unit,
         p_path=p_path / unit,
         p_step=p_step / unit,
+        interval_pnl=interval_pnl / unit_k,
+        interval_p_step=interval_p_step / unit_k,
         rv=rv,
         c0=c0,
         n_intervals=n_intervals,
@@ -352,8 +387,12 @@ def simulate_windows(S, t, r, starts, ends, sigma_i, K, h, c, q=0.0, is_call=Tru
     Returns
     -------
     HedgeResult
-        Every field has shape (W,) in window order; n_intervals is an int
-        array.
+        Every field has shape (W,) in window order and n_intervals is an int
+        array, except interval_pnl and interval_p_step, which have shape
+        (W, N_max) with N_max the largest N. They are aligned at expiry:
+        column j is the interval ending at close ends[w] - (N_max - 1 - j)·h
+        of the history, and columns before a window's first interval are
+        NaN.
 
     Raises
     ------
@@ -381,15 +420,47 @@ def simulate_windows(S, t, r, starts, ends, sigma_i, K, h, c, q=0.0, is_call=Tru
     sigma_i, K, q = per_window
 
     lengths = ends - starts
-    out = {name: np.empty(n_windows) for name in _FIELDS}
-    n_intervals = np.empty(n_windows, dtype=int)
+    parts = []
     for n in np.unique(lengths):
         rows = np.flatnonzero(lengths == n)
         closes = starts[rows, None] + np.arange(n + 1)
         res = simulate_window(
             S[closes], t[closes], r[closes[:, :-1]], sigma_i[rows], K[rows], h, c, q[rows], is_call
         )
+        parts.append((rows, res))
+    return _assemble(parts, n_windows)
+
+
+def _assemble(parts, n_windows, extra=()):
+    """Gather results of window groups into window order.
+
+    Parameters
+    ----------
+    parts : list of (rows, HedgeResult)
+        rows indexes the windows of one group. Its result has per-window
+        fields of shape (len(rows),) + extra, interval fields of shape
+        (len(rows),) + extra + (N,), and an int n_intervals.
+    n_windows : int
+        Total number of windows W.
+    extra : tuple of int, default ()
+        Trailing shape of each window's results (for example paths per
+        window).
+
+    Returns
+    -------
+    HedgeResult
+        Per-window fields of shape (W,) + extra; interval fields of shape
+        (W,) + extra + (N_max,), aligned at expiry and NaN-padded on the
+        left; n_intervals an int array of shape (W,).
+    """
+    n_max = max(res.n_intervals for _, res in parts)
+    out = {name: np.empty((n_windows,) + extra) for name in _FIELDS}
+    out.update({name: np.full((n_windows,) + extra + (n_max,), np.nan) for name in _INTERVAL_FIELDS})
+    n_intervals = np.empty(n_windows, dtype=int)
+    for rows, res in parts:
         for name in _FIELDS:
             out[name][rows] = getattr(res, name)
+        for name in _INTERVAL_FIELDS:
+            out[name][rows, ..., n_max - res.n_intervals :] = getattr(res, name)
         n_intervals[rows] = res.n_intervals
     return HedgeResult(**out, n_intervals=n_intervals)
