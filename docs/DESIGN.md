@@ -66,7 +66,7 @@ Hedging error and Figure 8
 
 Robustness
 - Exclude every window whose closes t0 to t_end include any trading day from 2025-04-03 to 2025-04-09 and rerun the ladder.
-- Non-overlapping subsamples, built greedily by date: starting from window k, each next window is the first whose start close is at or after the previous window's end close, so no two windows share a daily return (about 60 windows; taking every 21st window would share a step wherever a window has 22 steps). Build one from each of the first 21 windows (k = 0 to 20). Report the point estimates for k = 0, plus the median and the minimum to maximum of R²_45 and β across all 21. These subsamples are not bootstrapped.
+- Non-overlapping subsamples at a fixed stride of 22: subsample k holds windows k, k + 22, k + 44, ... for each offset k = 0 to 21, so the 22 subsamples partition all windows (about 56 windows each). No window has more than 22 steps, so each window of a subsample starts at or after the previous one's end close and no two share a daily return; the code checks this. A stride of 21 would share a step wherever a window has 22 steps, and a greedy rule (each next window the first to start at or after the previous end) was rejected because its chains lock onto Friday-to-Friday windows and merge, leaving few distinct subsamples. Report the point estimates for offset 0, plus the median and the minimum to maximum of R²_45 and β across all 22. These subsamples are not bootstrapped.
 - Report the share of windows with σ_i²·T0 > RV once; it does not depend on h or c.
 - Sensitivity: rerun with σ_i = VIX minus the variance-swap gap measured in section 8.
 

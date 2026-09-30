@@ -26,9 +26,9 @@ windows of the same length stack along a leading axis as (P, n + 1) and
 paths on the calendars of real windows through simulate_gbm_windows.
 
 The real-data study adds the rolling windows (study_windows), the April 2025
-exclusion (windows_containing), non-overlapping subsamples, the R² ladder with
-moving block bootstrap intervals, hedging error statistics and the weekday
-diagnostic of P_step residuals.
+exclusion (windows_containing), non-overlapping subsamples at a fixed stride
+(stride_subsamples), the R² ladder with moving block bootstrap intervals,
+hedging error statistics and the weekday diagnostic of P_step residuals.
 """
 
 from typing import NamedTuple
@@ -712,39 +712,39 @@ def windows_containing(dates, starts, ends, first, last):
     return (lo <= hi) & (starts <= hi) & (ends >= lo)
 
 
-def non_overlapping(starts, ends, first=0):
-    """Greedy subsample of windows that share no daily return.
+def stride_subsamples(starts, ends, stride):
+    """Non-overlapping subsamples of windows taken at a fixed stride.
 
-    Starting from window first, each next window is the first, in start
-    order, whose start close is at or after the previous window's end close.
+    Subsample k holds windows k, k + stride, k + 2·stride, ... for
+    k = 0, ..., stride - 1, so together the subsamples hold every window
+    exactly once. Each window of a subsample must start at or after the end
+    close of the one before it, so no two share a daily return.
 
     Parameters
     ----------
     starts, ends : array_like of int, shape (W,)
-        History indices of each window's first and last close; starts must
-        be strictly increasing.
-    first : int, default 0
-        Index of the window the subsample starts from.
+        History indices of each window's first and last close, in start
+        order.
+    stride : int
+        Step between the windows of a subsample, stride >= 1.
 
     Returns
     -------
-    ndarray of int
-        Increasing window indices, beginning with first.
+    list of ndarray of int
+        One array of increasing window indices per offset k (min(stride, W)
+        arrays).
 
     Raises
     ------
     ValueError
-        If starts is not strictly increasing or first is out of range.
+        If stride < 1, or two windows stride apart share a daily return.
     """
     starts, ends = np.asarray(starts), np.asarray(ends)
-    if np.any(np.diff(starts) <= 0):
-        raise ValueError("starts must be strictly increasing")
-    if not 0 <= first < starts.size:
-        raise ValueError("first must index a window")
-    chosen = [first]
-    while (nxt := np.searchsorted(starts, ends[chosen[-1]], side="left")) < starts.size:
-        chosen.append(int(nxt))
-    return np.array(chosen)
+    if stride < 1:
+        raise ValueError("stride must be at least 1")
+    if np.any(starts[stride:] < ends[:-stride]):
+        raise ValueError(f"windows {stride} apart share a daily return; use a larger stride")
+    return [np.arange(k, starts.size, stride) for k in range(min(stride, starts.size))]
 
 
 def block_bootstrap_indices(n, block, n_resamples, seed):

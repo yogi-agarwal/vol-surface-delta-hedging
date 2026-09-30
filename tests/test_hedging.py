@@ -15,13 +15,13 @@ from volsurf.hedging import (
     gbm_paths,
     hedge_grid,
     hedging_error_stats,
-    non_overlapping,
     ols_line,
     r2_45,
     r2_ladder,
     simulate_gbm_windows,
     simulate_window,
     simulate_windows,
+    stride_subsamples,
     study_windows,
     synthetic_window_set,
     weekday_diagnostic,
@@ -611,18 +611,34 @@ def test_windows_containing(calendar_history):
     assert not windows_containing(dates, starts, ends, "2021-10-02", "2021-10-03").any()
 
 
-def test_non_overlapping(calendar_history):
-    win = study_windows(calendar_history)
-    for first in range(3):
-        sub = non_overlapping(win.starts, win.ends, first)
-        assert sub[0] == first and sub.size >= 2
+def _check_stride_subsamples(win, stride):
+    """Assert that stride subsamples partition the windows and share no daily return."""
+    subs = stride_subsamples(win.starts, win.ends, stride)
+    assert len(subs) == stride
+    np.testing.assert_array_equal(np.sort(np.concatenate(subs)), np.arange(win.starts.size))
+    for k, sub in enumerate(subs):
+        assert sub[0] == k
+        np.testing.assert_array_equal(np.diff(sub), stride)
         assert (win.starts[sub[1:]] >= win.ends[sub[:-1]]).all()  # no shared daily return
-        assert (win.starts[sub[1:] - 1] < win.ends[sub[:-1]]).all()  # each is the first that fits
-        assert win.starts[-1] < win.ends[sub[-1]]  # nothing fits after the last
+    return subs
+
+
+def test_stride_subsamples(calendar_history):
+    win = study_windows(calendar_history)
+    longest = int((win.ends - win.starts).max())
+    _check_stride_subsamples(win, longest)  # the smallest stride with no overlap
+    _check_stride_subsamples(win, longest + 3)
+    # One step shorter than the longest window, the longest one overlaps the window after it.
     with pytest.raises(ValueError):
-        non_overlapping(win.starts[::-1], win.ends[::-1])
+        stride_subsamples(win.starts, win.ends, longest - 1)
     with pytest.raises(ValueError):
-        non_overlapping(win.starts, win.ends, first=win.starts.size)
+        stride_subsamples(win.starts, win.ends, 0)
+
+
+def test_stride_22_subsamples_on_frozen_history():
+    win = study_windows(load_history())
+    subs = _check_stride_subsamples(win, 22)
+    print(f"22 subsamples of {min(s.size for s in subs)} to {max(s.size for s in subs)} windows")
 
 
 # ---------------------------------------------------------------------------

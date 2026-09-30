@@ -31,7 +31,7 @@ KEEP_COLS = [
 
 
 def is_market_hours(now: datetime | None = None) -> bool:
-    """Return True if *now* falls within weekday 09:30–16:00 America/New_York."""
+    """Return True if *now* falls within weekday 09:30 to 16:00 America/New_York."""
     if now is None:
         now = datetime.now(tz=NY)
     now_ny = now.astimezone(NY)
