@@ -263,7 +263,7 @@ def test_daily_5bp_costs(flat_paths):
     assert std == pytest.approx(0.184, abs=0.005)
 
 
-@pytest.mark.parametrize("q, expected", [(0.013, 0.0264), (0.0, 0.0)])
+@pytest.mark.parametrize("q, expected", [(0.013, 0.0270), (0.0, 0.0)])
 def test_carry_consistency(q, expected):
     # Total-return path with drift r; K is the pricing model's forward S0·exp((r - q)T).
     r = 0.04

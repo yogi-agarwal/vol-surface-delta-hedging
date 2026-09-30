@@ -48,11 +48,13 @@ Predictors (the R² ladder), computed on the same rebalancing grid as the actual
 - For each predictor report R²_45 = 1 - Σ(y - p)²/Σ(y - ȳ)² (about the 45 degree line) and OLS y = α + β·p with Newey-West (HAC, maxlags = 21) standard errors. Theory says α = 0, β = 1.
 - The headline R² is P_gap's, because the research question asks about the vol gap. The ladder attributes the shortfall: moneyness drift (P_path vs P_gap), timing of moves against gamma (P_step vs P_path), discreteness and jumps (actual vs P_step).
 - Sanity ranges on synthetic GBM windows (verified; 3,000 windows, σ_i ~ lognormal(ln 0.17, 0.35), σ_true = σ_i·exp(N(-0.2, 0.3))): daily R²_45 = 0.77 / 0.93 / 0.98 for P_gap / P_path / P_step; every 5 days 0.40 / 0.46 / 0.92. Real data should sit lower on P_step because of jumps.
+- These ranges are illustrative and seed-dependent, so no test asserts them (section 4 tests only P_step R²_45 ≥ 0.95). Across 200 seed pairs the daily P_step median is 0.976, and a single large-move window can pull it down.
 
 Hedging error and Figure 8
 - e = P&L - P_gap per window. For each (h, c) report mean, std and RMSE = √(mean² + std²).
-- Figure 8: RMSE against N, one line per cost level, plus a panel with mean and std; overlay the synthetic GBM curve (σ_r = σ_i) as a reference.
-- Expected pattern (verified, synthetic): costs move the mean, not the spread. Daily std at 0 / 1 / 5 bp was 18.6% / 18.6% / 18.4% of premium. On RMSE, daily beats every-2-days and every-5-days up to 5 bp, ties every-2-days near 25 bp, and loses to every-5-days at 100 bp.
+- Figure 8: RMSE against N, one line per cost level, plus a panel with mean and std; overlay the synthetic GBM curve (σ_true = σ_i) as a reference.
+- The synthetic reference computes P_gap from each synthetic path's own realised variance, the same definition as on real data, so the curves are comparable. Also draw the known-vol Derman-Kamal curve (P_gap = 0) as a labelled dashed line.
+- Expected pattern (verified, synthetic): costs move the mean, not the spread. Daily std of P&L (the P_gap = 0 case) at 0 / 1 / 5 bp was 18.6% / 18.6% / 18.4% of premium. On RMSE, daily beats every-2-days and every-5-days up to 5 bp, ties every-2-days near 25 bp, and loses to every-5-days at 100 bp.
 
 Robustness
 - Exclude every window containing any trading day from 2025-04-03 to 2025-04-09 and rerun the ladder.
@@ -67,7 +69,7 @@ Setup: GBM with σ_true = σ_i = 0.18, r = q = 0, S0 = 100, K = F0, T = 21/252, 
 - Every 2 days: std/C0 about 0.252 (Derman-Kamal 0.273).
 - Mean interior turnover within 5% of √N/π = 1.458679 shares per option share (verified 1.417).
 - 5 bp, daily: mean -6.0% ± 0.5% of C0, std about 18.4%.
-- Carry consistency: a total-return path (drift r = 0.04, σ = 0.18) priced and hedged with q = 0.013 gives mean +2.64% ± 0.3% of C0; with q = 0 it gives 0 ± 0.3% (verified -0.08%). This guards against pairing adjusted closes with a dividend yield.
+- Carry consistency: a total-return path (drift r = 0.04, σ = 0.18) priced and hedged with q = 0.013 gives mean +2.70% ± 0.3% of C0; with q = 0 it gives 0 ± 0.3% (verified -0.08%). This guards against pairing adjusted closes with a dividend yield. The earlier +2.64% included sampling noise; +2.70% is the exact expectation with K = S0·exp((r - q)T), since the hedge has zero mean under Q whatever delta is used.
 - P_step R²_45 ≥ 0.95 on the synthetic window set in section 3 (verified 0.977).
 
 ## 5. Chain cleaning (Stage 2b)
