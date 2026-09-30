@@ -83,9 +83,10 @@ class HedgeResult(NamedTuple):
     interval_pnl : ndarray, trailing axis of length N
         Hedged P&L of each hedge interval a -> b:
         G_b·V_b - G_a·V_a - Delta_a·(G_b·S_b - G_a·S_a) + G_a·cost_a, where V
-        is the Black-Scholes value at sigma_i, r_a and the remaining time
-        (V_n is the payoff) and cost_a <= 0 is the cost of the trade at a; the
-        last interval also carries the unwind cost. Sums to pnl.
+        at a grid close is the Black-Scholes value at sigma_i, that close's
+        own rate and the remaining time (V_a at r_a, V_b at r_b; V_n is the
+        payoff) and cost_a <= 0 is the cost of the trade at a; the last
+        interval also carries the unwind cost. Sums to pnl.
     interval_p_step : ndarray, trailing axis of length N
         The P_step term of each interval, ½·G_a·Gamma_a·S_a²·(R² - sigma_i²·dt).
         Sums to p_step.
