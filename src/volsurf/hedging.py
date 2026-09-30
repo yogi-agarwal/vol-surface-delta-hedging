@@ -29,7 +29,8 @@ The real-data study adds the rolling windows (study_windows), the April 2025
 exclusion (windows_containing), non-overlapping subsamples at a fixed stride
 (stride_subsamples) and their ladder summary (stride_ladder), the R² ladder
 with moving block bootstrap intervals, multi-regressor OLS (ols_fit),
-hedging error statistics and the weekday diagnostic of P_step residuals.
+hedging error statistics, the weekday diagnostic of P_step residuals and the
+weekend variance ratio of the returns.
 """
 
 from typing import NamedTuple
@@ -1059,3 +1060,70 @@ def weekday_diagnostic(interval_pnl, interval_p_step, dates, starts, ends, h, bo
     between = np.sum(n_d[n_d > 0] * (table["residual"].to_numpy()[:-1][n_d > 0] - grand_mean) ** 2)
     eta2 = between / np.sum((resid[valid] - grand_mean) ** 2)
     return table, eta2
+
+
+def weekend_variance_ratio(dates, S, boot_idx=None, level=0.95):
+    """Mean squared Friday-to-Monday log return over the mean squared single-weekday log return.
+
+    A return runs from one close to the next. It is Friday-to-Monday when it
+    starts on a Friday and ends three calendar days later, and single-weekday
+    when its two closes are one calendar day apart; returns across a holiday
+    enter neither mean. Calendar-time pricing charges a weekend three days of
+    variance, so the ratio is 3 if variance accrues in calendar time and 1 if
+    it accrues per trading day.
+
+    Parameters
+    ----------
+    dates : DatetimeIndex or array_like of datetime64, shape (M,)
+        Increasing dates of the closes.
+    S : array_like of shape (M,)
+        Closes, M >= 2.
+    boot_idx : ndarray of int, shape (B, M - 1), optional
+        Resamples of the M - 1 returns in date order
+        (block_bootstrap_indices). Both means are recomputed on each, for a
+        percentile interval of the ratio.
+    level : float, default 0.95
+        Coverage of the interval.
+
+    Returns
+    -------
+    dict
+        ratio, and lo and hi (its interval, NaN without boot_idx); n_weekend
+        and n_weekday (the number of returns in each mean); weekend_ms and
+        weekday_ms (the mean squared log returns, not annualised).
+
+    Raises
+    ------
+    ValueError
+        If S and dates differ in length, S has fewer than two closes, or
+        boot_idx does not have one column per return.
+    """
+    dates = pd.DatetimeIndex(dates)
+    S = np.asarray(S, dtype=float)
+    if S.ndim != 1 or S.size != dates.size or S.size < 2:
+        raise ValueError("S must be 1-D, at least two closes, one per date")
+    sq = np.diff(np.log(S)) ** 2
+    gap = np.diff(dates.to_numpy()) / np.timedelta64(1, "D")
+    weekend = (dates.weekday.to_numpy()[:-1] == 4) & (gap == 3)
+    weekday = gap == 1
+    out = {
+        "n_weekend": int(weekend.sum()),
+        "n_weekday": int(weekday.sum()),
+        "weekend_ms": sq[weekend].mean(),
+        "weekday_ms": sq[weekday].mean(),
+    }
+    out["ratio"] = out["weekend_ms"] / out["weekday_ms"]
+    out["lo"] = out["hi"] = np.nan
+    if boot_idx is not None:
+        boot_idx = np.asarray(boot_idx)
+        n_resamples, n_returns = boot_idx.shape
+        if n_returns != sq.size:
+            raise ValueError(f"boot_idx must have one column per return ({sq.size}); got {n_returns}")
+        # Weight each return by how often a resample draws it; each mean is a ratio of weighted sums.
+        cells = (np.arange(n_resamples)[:, None] * n_returns + boot_idx).ravel()
+        weights = np.bincount(cells, minlength=n_resamples * n_returns).reshape(n_resamples, n_returns)
+        with np.errstate(invalid="ignore", divide="ignore"):  # a resample without weekends gives NaN
+            boot = (weights @ (sq * weekend) / (weights @ weekend)) / (weights @ (sq * weekday) / (weights @ weekday))
+        tails = [50.0 * (1.0 - level), 100.0 - 50.0 * (1.0 - level)]
+        out["lo"], out["hi"] = np.percentile(boot, tails)
+    return out

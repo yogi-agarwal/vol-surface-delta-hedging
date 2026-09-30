@@ -28,6 +28,7 @@ from volsurf.hedging import (
     study_windows,
     synthetic_window_set,
     weekday_diagnostic,
+    weekend_variance_ratio,
     windows_containing,
 )
 
@@ -866,3 +867,49 @@ def test_weekday_diagnostic_bootstrap(calendar_history):
     np.testing.assert_allclose(table["residual_lo"], lo, rtol=1e-12, atol=1e-15)
     np.testing.assert_allclose(table["residual_hi"], hi, rtol=1e-12, atol=1e-15)
     assert (table["residual_hi"] > table["residual_lo"]).all()
+
+
+# ---------------------------------------------------------------------------
+# Weekend variance ratio
+# ---------------------------------------------------------------------------
+
+def test_weekend_variance_ratio():
+    dates = pd.bdate_range("2024-01-01", "2024-03-29")
+    dates = dates[~dates.isin(pd.to_datetime(["2024-01-15", "2024-02-14"]))]  # a Monday and a Wednesday holiday
+    gap = np.diff(dates.to_numpy()) / np.timedelta64(1, "D")
+    weekend = (dates.weekday.to_numpy()[:-1] == 4) & (gap == 3)
+    weekday = gap == 1
+    holiday = ~(weekend | weekday)
+    assert holiday.sum() == 2  # Friday to Tuesday (4 days) and Tuesday to Thursday (2 days)
+
+    # Weekend returns with three times the squared size of weekday ones; huge returns across the
+    # holidays must enter neither mean.
+    signs = np.where(np.arange(gap.size) % 2 == 0, 1.0, -1.0)
+    log_ret = signs * np.where(weekend, math.sqrt(3) * 0.01, 0.01)
+    log_ret[holiday] = 0.5
+    S = 100.0 * np.exp(np.concatenate([[0.0], np.cumsum(log_ret)]))
+    out = weekend_variance_ratio(dates, S)
+    assert out["ratio"] == pytest.approx(3.0, rel=1e-12)
+    assert out["n_weekend"] == weekend.sum() and out["n_weekday"] == weekday.sum()
+    assert out["n_weekend"] + out["n_weekday"] + 2 == gap.size
+    assert out["weekday_ms"] == pytest.approx(1e-4, rel=1e-12)
+    assert np.isnan(out["lo"]) and np.isnan(out["hi"])
+    same = np.tile(np.arange(gap.size), (3, 1))  # resamples equal to the sample
+    out = weekend_variance_ratio(dates, S, same)
+    assert out["lo"] == pytest.approx(out["ratio"], rel=1e-12) and out["hi"] == pytest.approx(out["ratio"], rel=1e-12)
+
+    # Random returns and block resamples that repeat and drop returns, against a brute-force loop.
+    S = 100.0 * np.exp(np.concatenate([[0.0], np.cumsum(0.01 * np.random.default_rng(23).standard_normal(gap.size))]))
+    sq = np.diff(np.log(S)) ** 2
+    boot = block_bootstrap_indices(gap.size, 5, 30, seed=24)
+    assert not (boot == np.arange(gap.size)).all(axis=1).any()
+    out = weekend_variance_ratio(dates, S, boot)
+    assert out["ratio"] == pytest.approx(sq[weekend].mean() / sq[weekday].mean(), rel=1e-12)
+    brute = [sq[idx][weekend[idx]].mean() / sq[idx][weekday[idx]].mean() for idx in boot]
+    assert (out["lo"], out["hi"]) == pytest.approx(np.percentile(brute, [2.5, 97.5]), rel=1e-12)
+    assert out["lo"] < out["ratio"] < out["hi"]
+
+    with pytest.raises(ValueError):
+        weekend_variance_ratio(dates[:-1], S)
+    with pytest.raises(ValueError):
+        weekend_variance_ratio(dates, S, boot[:, :-1])
