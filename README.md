@@ -2,7 +2,7 @@
 
 SPY implied volatility surface construction and delta-hedging P&L attribution.
 
-**Status:** In progress: Stages 0 to 2a complete
+**Status:** In progress: Stages 0 to 5a complete
 
 ## Research question
 
