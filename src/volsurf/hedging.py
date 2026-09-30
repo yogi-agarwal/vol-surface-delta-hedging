@@ -68,6 +68,13 @@ class HedgeResult(NamedTuple):
         option (not a fraction of C0).
     p_gap : ndarray
         Vol-gap predictor G_0·vega_0·(sigma_r² - sigma_i²)/(2·sigma_i).
+    p_price : ndarray
+        Price predictor G_0·(V_0(sigma_r) - C0): the option at t_0 (same S_0,
+        K, T0, r_0 and q) priced at the realised vol sigma_r minus its
+        premium, carried to expiry, so BS(sigma_r)/C0 - 1 as a fraction of
+        C0·G_0. Priced at the true vol of a GBM path with risk-neutral drift
+        and a flat rate, it is the exact expected hedged P&L at any
+        rebalancing interval and without costs.
     p_path : ndarray
         Gamma-path predictor ½·(sigma_r² - sigma_i²)·sum_k G_k·Gamma_k·S_k²·dt_k.
     p_step : ndarray
@@ -99,6 +106,7 @@ class HedgeResult(NamedTuple):
     costs: np.ndarray
     turnover: np.ndarray
     p_gap: np.ndarray
+    p_price: np.ndarray
     p_path: np.ndarray
     p_step: np.ndarray
     interval_pnl: np.ndarray
@@ -201,6 +209,28 @@ def r2_45(y, p):
     p = np.asarray(p, dtype=float)
     spread = y - y.mean(axis=-1, keepdims=True)
     return 1.0 - np.sum((y - p) ** 2, axis=-1) / np.sum(spread**2, axis=-1)
+
+
+def r2_ols(y, p):
+    """Plain OLS R² of y on p with an intercept, along the last axis.
+
+    Parameters
+    ----------
+    y, p : array_like of the same shape (..., n)
+        Outcomes and predictions.
+
+    Returns
+    -------
+    float or ndarray of shape (...)
+        The squared correlation of y and p, which is r2_45 about the OLS line
+        of y on p. It ignores the intercept and slope, so unlike r2_45 it
+        measures linear explanatory power alone, not calibration.
+    """
+    y = np.asarray(y, dtype=float)
+    p = np.asarray(p, dtype=float)
+    dy = y - y.mean(axis=-1, keepdims=True)
+    dp = p - p.mean(axis=-1, keepdims=True)
+    return np.sum(dy * dp, axis=-1) ** 2 / (np.sum(dy**2, axis=-1) * np.sum(dp**2, axis=-1))
 
 
 def ols_line(y, p):
@@ -323,14 +353,14 @@ def simulate_window(S, t, r, sigma_i, K, h, c, q=0.0, is_call=True):
     Returns
     -------
     HedgeResult
-        P&L, its components and the three predictors, each in expiry money
+        P&L, its components and the four predictors, each in expiry money
         as a fraction of C0·G_0 with shape () or (P,), plus turnover, rv, c0
         and N. interval_pnl and interval_p_step have shape () + (N,) or
         (P, N), interval k running from grid close k to grid close k + 1 of
         hedge_grid(n, h). Delta, Gamma and the option mark at close k use
         sigma_i, rate r_k and remaining time t_n - t_k; R_k = S_{k+1}/S_k - 1
         and dt_k = t_{k+1} - t_k run over the hedge grid, and
-        sigma_r² = rv/T0.
+        sigma_r² = rv/T0 (p_price is NaN if rv = 0).
 
     Raises
     ------
@@ -396,10 +426,12 @@ def simulate_window(S, t, r, sigma_i, K, h, c, q=0.0, is_call=True):
     # Predictors on the hedge grid, each term carried to expiry.
     rv = np.sum(np.diff(np.log(S), axis=-1) ** 2, axis=-1)
     var_gap = rv / T0 - sigma_i**2
+    sigma_r = np.sqrt(rv / T0)
     dt_g = np.diff(t_g, axis=-1)
     ret_g = S_g[..., 1:] / S_g[..., :-1] - 1.0
     dollar_gamma = g_set * gamma * S_set**2
     p_gap = g0 * vega0 * var_gap / (2.0 * sigma_i)
+    p_price = g0 * (bs_price(S[..., 0], K, T0, r[..., 0], q, sigma_r, is_call) - c0)
     p_path = 0.5 * var_gap * np.sum(dollar_gamma * dt_g, axis=-1)
     interval_p_step = 0.5 * dollar_gamma * (ret_g**2 - sig**2 * dt_g)
     p_step = np.sum(interval_p_step, axis=-1)
@@ -414,6 +446,7 @@ def simulate_window(S, t, r, sigma_i, K, h, c, q=0.0, is_call=True):
         costs=costs / unit,
         turnover=turnover,
         p_gap=p_gap / unit,
+        p_price=p_price / unit,
         p_path=p_path / unit,
         p_step=p_step / unit,
         interval_pnl=interval_pnl / unit_k,
@@ -806,7 +839,7 @@ def block_bootstrap_indices(n, block, n_resamples, seed):
     return (first[..., None] + np.arange(block)).reshape(n_resamples, -1)[:, :n]
 
 
-_LADDER_COLUMNS = ["n", "r2_45", "r2_lo", "r2_hi", "alpha", "beta", "beta_lo", "beta_hi"]
+_LADDER_COLUMNS = ["n", "r2_45", "r2_lo", "r2_hi", "r2_ols", "alpha", "beta", "beta_lo", "beta_hi"]
 
 
 def r2_ladder(y, predictors, boot_idx=None, level=0.95):
@@ -828,8 +861,9 @@ def r2_ladder(y, predictors, boot_idx=None, level=0.95):
     -------
     pd.DataFrame
         One row per predictor with columns n, r2_45 (r2_45), r2_lo and r2_hi
-        (its interval), alpha and beta (ols_line; alpha in the units of y),
-        beta_lo and beta_hi. Interval columns are NaN without boot_idx.
+        (its interval), r2_ols (r2_ols, the plain OLS R²), alpha and beta
+        (ols_line; alpha in the units of y), beta_lo and beta_hi. Interval
+        columns are NaN without boot_idx.
     """
     y = np.asarray(y, dtype=float)
     tails = [50.0 * (1.0 - level), 100.0 - 50.0 * (1.0 - level)]
@@ -839,7 +873,7 @@ def r2_ladder(y, predictors, boot_idx=None, level=0.95):
         if y.ndim != 1 or p.shape != y.shape:
             raise ValueError(f"y and {name} must be 1-D arrays of the same length")
         alpha, beta = ols_line(y, p)
-        row = {"n": y.size, "r2_45": r2_45(y, p), "alpha": alpha, "beta": beta}
+        row = {"n": y.size, "r2_45": r2_45(y, p), "r2_ols": r2_ols(y, p), "alpha": alpha, "beta": beta}
         row.update(r2_lo=np.nan, r2_hi=np.nan, beta_lo=np.nan, beta_hi=np.nan)
         if boot_idx is not None:
             y_b, p_b = y[boot_idx], p[boot_idx]
@@ -849,7 +883,7 @@ def r2_ladder(y, predictors, boot_idx=None, level=0.95):
     return pd.DataFrame.from_dict(rows, orient="index")[_LADDER_COLUMNS]
 
 
-_STRIDE_STATS = ("r2_45", "beta")
+_STRIDE_STATS = ("r2_45", "r2_ols", "beta")
 
 
 def stride_ladder(y, predictors, subsamples):
@@ -869,8 +903,8 @@ def stride_ladder(y, predictors, subsamples):
     -------
     pd.DataFrame
         One row per predictor. n_offset0 is the number of windows in
-        subsample 0; for each statistic s in r2_45 and beta (the r2_ladder
-        columns), s_offset0 is its value on subsample 0 and s_median, s_min
+        subsample 0; for each statistic s in r2_45, r2_ols and beta (the
+        r2_ladder columns), s_offset0 is its value on subsample 0 and s_median, s_min
         and s_max summarise it across all subsamples. No bootstrap.
     """
     y = np.asarray(y, dtype=float)

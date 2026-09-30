@@ -19,6 +19,7 @@ from volsurf.hedging import (
     ols_line,
     r2_45,
     r2_ladder,
+    r2_ols,
     simulate_gbm_windows,
     simulate_window,
     simulate_windows,
@@ -45,6 +46,7 @@ SEED_FLAT = 1  # r = 0 paths for the frictionless and cost checks
 SEED_DRIFT = 2  # drift r = 0.04 paths for the carry check
 SEED_SET_VOLS = 3  # sigma_i and sigma_true draws for the synthetic window set
 SEED_SET_PATHS = 4  # paths for the synthetic window set
+SEED_VOL_GAP = 5  # paths for the P_price expectation check
 
 INTERVAL_FIELDS = ["interval_pnl", "interval_p_step"]
 FIELDS = [f for f in HedgeResult._fields if f not in ["n_intervals", *INTERVAL_FIELDS]]
@@ -198,6 +200,8 @@ def _reference_window(S, t, r, sigma, K, h, c, q, is_call=True):
         p_step += interval_p_step[-1]
     vega0 = bs_vega(S[0], K, expiry - t[0], r[0], q, sigma)
     p_gap = to_expiry(0) * vega0 * var_gap / (2 * sigma)
+    sigma_r = math.sqrt(rv / (expiry - t[0]))
+    p_price = to_expiry(0) * (bs_price(S[0], K, expiry - t[0], r[0], q, sigma_r, is_call) - c0)
     return {
         "interval_pnl": interval_pnl / premium,
         "interval_p_step": np.array(interval_p_step) / premium,
@@ -208,6 +212,7 @@ def _reference_window(S, t, r, sigma, K, h, c, q, is_call=True):
         "costs": costs / premium,
         "turnover": turnover,
         "p_gap": p_gap / premium,
+        "p_price": p_price / premium,
         "p_path": p_path / premium,
         "p_step": p_step / premium,
         "rv": rv,
@@ -272,7 +277,7 @@ def test_broadcasting_matches_single_path(uneven_window):
     S, t, r, sigma, K, q = uneven_window
     res = simulate_window(S, t, r, sigma, K, h=2, c=0.0005, q=q)
     one = simulate_window(S[3], t, r, sigma[3], K[3], h=2, c=0.0005, q=q[3])
-    for name in ("pnl", "stock", "financing", "costs", "turnover", "p_gap", "p_path", "p_step"):
+    for name in ("pnl", "stock", "financing", "costs", "turnover", "p_gap", "p_price", "p_path", "p_step"):
         assert np.ndim(getattr(one, name)) == 0
         assert getattr(res, name)[3] == pytest.approx(getattr(one, name), rel=1e-14, abs=1e-15)
     for name in INTERVAL_FIELDS:
@@ -477,6 +482,27 @@ def test_carry_consistency(q, expected, exact_value):
     assert mean == pytest.approx(expected, abs=0.003)
 
 
+@pytest.mark.parametrize("sigma_true, exact_value", [(0.27, 0.499789), (0.12, -0.333292)])
+def test_p_price_is_expected_pnl_under_gbm(sigma_true, exact_value):
+    # Under Q with volatility sigma_true the discounted hedge gains have zero mean whatever the
+    # delta, so the mean P&L over C0 grown to expiry is exactly BS(sigma_true)/BS(sigma_i) - 1,
+    # P_price at the true vol, at any rebalancing interval. The tolerance is 0.6% and 0.9% of the
+    # exact value, about 4 and 8 Monte Carlo standard errors.
+    r = 0.04
+    K = S0 * math.exp(r * T)
+    exact = bs_price(S0, K, T, r, 0.0, sigma_true) / bs_price(S0, K, T, r, 0.0, SIGMA) - 1.0
+    paths = gbm_paths(S0, r, sigma_true, TIMES, N_PATHS, seed=SEED_VOL_GAP)
+    res = simulate_window(paths, TIMES, r, SIGMA, K, h=1, c=0.0)
+    mean, se = res.pnl.mean(), res.pnl.std() / math.sqrt(N_PATHS)
+    p_gap_true = bs_vega(S0, K, T, r, 0.0, SIGMA) * (sigma_true**2 - SIGMA**2) / (2 * SIGMA) / bs_price(S0, K, T, r, 0.0, SIGMA)
+    print(f"sigma_true = {sigma_true}: mean P&L/(C0·G0) = {mean:.6f} (se {se:.6f}), exact P_price = {exact:.6f}, "
+          f"P_gap at the true vol = {p_gap_true:.6f}")
+    assert exact == pytest.approx(exact_value, abs=5e-7)
+    assert mean == pytest.approx(exact, abs=0.003)
+    # P_price evaluated per path at its own realised vol, as the ladder does, is the same number on average.
+    np.testing.assert_allclose(res.p_price, bs_price(S0, K, T, r, 0.0, np.sqrt(res.rv / T)) / res.c0 - 1.0, rtol=1e-12, atol=1e-14)
+
+
 def test_p_step_r2_on_synthetic_window_set():
     # DESIGN.md section 3: 3,000 windows, sigma_i ~ lognormal(ln 0.17, 0.35),
     # sigma_true = sigma_i·exp(N(-0.2, 0.3)), daily hedging, r = q = 0, K = F0.
@@ -653,6 +679,19 @@ def test_r2_45_along_last_axis():
     np.testing.assert_allclose(r2_45(y, p), [0.5, 0.0], rtol=0, atol=1e-15)
 
 
+def test_r2_ols():
+    rng = np.random.default_rng(22)
+    p = rng.standard_normal(50)
+    y = 0.4 + 2.5 * p + rng.standard_normal(50)
+    value = r2_ols(y, p)
+    assert value == pytest.approx(np.corrcoef(y, p)[0, 1] ** 2, rel=1e-12)
+    alpha, beta = ols_line(y, p)
+    assert value == pytest.approx(r2_45(y, alpha + beta * p), rel=1e-12)  # R² about the OLS line
+    assert r2_ols(y, -3.0 + 0.2 * p) == pytest.approx(value, rel=1e-12)  # blind to calibration
+    assert r2_45(y, -3.0 + 0.2 * p) < value
+    np.testing.assert_allclose(r2_ols(np.stack([y, y]), np.stack([p, y])), [value, 1.0], rtol=1e-12)
+
+
 def test_ols_line():
     p = np.linspace(-1.0, 2.0, 7)
     alpha, beta = ols_line(0.3 + 1.7 * p, p)
@@ -718,6 +757,13 @@ def test_r2_ladder():
     assert (noisy["alpha"], noisy["beta"]) == pytest.approx(ols_line(y, p), rel=1e-14)
     assert noisy["r2_lo"] < noisy["r2_45"] < noisy["r2_hi"]
     assert noisy["beta_lo"] < noisy["beta"] < noisy["beta_hi"]
+    assert noisy["r2_ols"] == pytest.approx(r2_ols(y, p), rel=1e-14)
+    assert perfect["r2_ols"] == pytest.approx(1.0, rel=1e-14)
+    # The intervals are the 2.5% and 97.5% percentiles of each statistic over the resamples.
+    r2_b = [r2_45(y[idx], p[idx]) for idx in boot]
+    beta_b = [ols_line(y[idx], p[idx])[1] for idx in boot]
+    assert (noisy["r2_lo"], noisy["r2_hi"]) == pytest.approx(np.percentile(r2_b, [2.5, 97.5]), rel=1e-12)
+    assert (noisy["beta_lo"], noisy["beta_hi"]) == pytest.approx(np.percentile(beta_b, [2.5, 97.5]), rel=1e-12)
     assert r2_ladder(y, {"noisy": p})[["r2_lo", "r2_hi", "beta_lo", "beta_hi"]].isna().all(axis=None)
 
 
@@ -732,6 +778,7 @@ def test_stride_ladder():
         # Explicit loop over the subsamples.
         stats = {
             "r2_45": [r2_45(y[sub], p[sub]) for sub in subsamples],
+            "r2_ols": [np.corrcoef(y[sub], p[sub])[0, 1] ** 2 for sub in subsamples],
             "beta": [ols_line(y[sub], p[sub])[1] for sub in subsamples],
         }
         row = table.loc[name]
