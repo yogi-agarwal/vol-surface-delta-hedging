@@ -12,6 +12,7 @@ Values marked (verified) were reproduced independently in Python (NumPy 2.4, Sci
 | 2a | Black-76 pricing and Greeks | stage-2a |
 | 5a | Hedging engine and synthetic theory tests | stage-5a |
 | 5b | Real-data hedging study: Figures 6 to 8, Table 4 | stage-5b |
+| 5c | OptionMetrics sensitivity: σ_i = ATM implied vol, VIX gap, Figure 7b, Table 4d | stage-5c |
 | 2b | Chain cleaning, parity forwards, filters: Table 1 | stage-2b |
 | 2c | Implied vol solver, no-IV filter, Newton demo: Figure 1 | stage-2c |
 | 3 | SVI calibration: Figure 2, Table 2 | stage-3 |
@@ -70,6 +71,15 @@ Robustness
 - Report the share of windows with σ_i²·T0 > RV once; it does not depend on h or c.
 - Sensitivity: rerun with σ_i = VIX minus the variance-swap gap measured in section 8.
 
+OptionMetrics sensitivity (Stage 5c)
+- Data: two licensed WRDS OptionMetrics files in data/raw/. om_spy_std_30d_2021_2025.csv holds the standardised 30-day ATM-forward SPY call and put, 2021-06-01 to 2025-08-29. om_spy_volsurf_2021_2025.csv holds the volatility surface (34 deltas by 11 maturities), of which only days = 30 is read. data.load_optionmetrics returns, per date, sigma_atm = the mean of the call and put impl_volatility (NaN if either is missing) and the 30-day surface IVs at delta -25 (put), 25 (call) and 50 (call). It returns None if either file is absent and never downloads anything.
+- Licensing (binding): WRDS data is never committed and never printed row by row. Notebook outputs, figures and README may contain only aggregates and charts. The Stage 5c notebook section prints one line and skips when the files are absent, so a clean install still runs top to bottom.
+- Rerun: the section 3 windows that start on or before 2025-08-29, the last OptionMetrics date, hedged daily (h = 1) at c = 0 with K = F0 as before. Run once with σ_i = sigma_atm at t0 and once with σ_i = VIX on exactly the same windows, so the two are directly comparable.
+- Reported for both: window count, mean σ_i, the share of windows with σ_i²·T0 > RV, and the mean and std (ddof 0) of hedged P&L. Then the R² ladder with moving block bootstrap intervals (block 42, 2,000 resamples, seed 20260930, drawn on this shorter sequence of windows, the same resamples for both σ_i), the April 2025 exclusion (resampled on its own sequence), and the stride-22 subsamples of these windows (offset 0, median, and minimum to maximum).
+- VIX gap: VIX - sigma_atm on every OptionMetrics date, reported as count, mean, median, minimum and maximum in vol points. OLS of the gap on the 30-day risk reversal RR = IV(25-delta put) - IV(25-delta call), reporting slope, intercept and R².
+- The slope and R² get moving block bootstrap intervals on the daily series: block 21 trading days, 2,000 resamples, seed 20260930, the OLS refitted on each resample, 2.5% and 97.5% percentiles. Daily observations need this because they are not independent. Consecutive days' 30-day vols price options whose lives overlap by all but one day, and both the gap and RR are persistent level series. OLS standard errors or an i.i.d. bootstrap would treat about a thousand dependent days as independent draws and give intervals that are too narrow. A block of 21 trading days (about one option month) keeps that dependence inside each block. The notebook prints the lag-1 autocorrelation of both series as evidence.
+- Figure 7b: VIX, the OptionMetrics 30-day ATM vol and the realised vol of the following 30 days, by window start date.
+
 ## 4. Discrete hedging checks (tests/test_hedging.py)
 Setup: GBM with σ_true = σ_i = 0.18, r = q = 0, S0 = 100, K = F0, T = 21/252, 21 daily steps, 200,000 paths, fixed seed. With r = 0, C0·G0 = C0, so only the carry check depends on the money-unit convention.
 - Mean P&L/C0 within ±0.5% (verified -0.02%).
@@ -121,13 +131,14 @@ Figures
 5. Butterfly check: density (or g) against k per expiry.
 6. Actual P&L against P_gap, one point per window, 45 degree line, R²_45 and slope on the plot (optional second panel for P_step).
 7. VIX against realised vol of the following 30 days, by date.
+7b. VIX and the OptionMetrics 30-day ATM vol against realised vol of the following 30 days, by date (Stage 5c; skipped without the licensed files).
 8. Hedging error RMSE against rebalances per window, one line per cost level, with the mean/std panel.
 
 Tables
 1. Data summary: expiries, strike ranges, contracts kept, removals per filter, and implied F, D, r and carry per expiry.
 2. SVI parameters per expiry with near-the-money and overall fit errors in vol points.
 3. Butterfly and calendar violations per expiry, before and after constraints.
-4. Hedging summary by h and c: mean, std, RMSE, the R² ladder with slopes, plus the robustness and sensitivity rows.
+4. Hedging summary by h and c: mean, std, RMSE, the R² ladder with slopes, plus the robustness and sensitivity rows. Table 4d is the Stage 5c sensitivity: σ_i = OptionMetrics ATM vol against σ_i = VIX on the same windows.
 
 ## 10. Limitations to state in README
 - Overlapping windows are not independent: report the non-overlapping subsample and moving block bootstrap intervals.
@@ -141,3 +152,4 @@ Tables
 - ^VIX closes at 16:15 ET, 15 minutes after SPY, so σ_i is observed slightly after the SPY close it is paired with.
 - Delta is computed from a close and traded at that same close, which assumes no execution lag.
 - P_gap is ex post by construction: it uses the window's own realised variance, so it attributes P&L after the fact and is not a forecast.
+- The OptionMetrics data is licensed and not distributed, so the Stage 5c sensitivity runs only where the files are present, and it covers only windows starting up to 2025-08-29.
