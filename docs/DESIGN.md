@@ -32,29 +32,34 @@ The hedging track goes first because it needs only pricing and historical data.
 Conventions
 - Prices: yfinance closes with auto_adjust=True (a total-return series), so q = 0.
 - σ_i = ^VIX close at window start / 100, held fixed through the window.
-- r_t = ^IRX close / 100, forward-filled; cash accrues at r_t over calendar days.
+- ^IRX quotes the 13-week bill discount yield: d_t = ^IRX close / 100, forward-filled, converted at load time (data.irx_to_rate) to the continuously compounded r_t = -ln(1 - d_t·91/360)/(91/365); d = 0.0535 gives 0.0546. The frozen file keeps d, so no re-download is needed. Cash accrues at r_t over calendar days.
 - Windows: one per trading day t0 from the first trading day of October 2021 to the last start date with a full window. t_end = last trading day on or before t0 + 30 calendar days. T0 = (t_end - t0 in calendar days)/365.
 - Option: European call, K = F0 = S0·exp(r0·T0), bought at its Black-Scholes value with σ_i, expiring at the t_end close.
 - Hedge: short Δ (computed at σ_i and remaining calendar T) at each rebalance close; unwind at t_end.
-- Rebalance every h trading days, h in {1, 2, 3, 5, 7, 10, 21}. N = number of hedge intervals in the window.
+- Rebalance every h trading days, h in {1, 2, 3, 5, 7, 10, 21}, counted back from expiry: the hedge is set at t0 and at the closes h, 2h, ... trading days before t_end. Any stub shorter than h therefore opens the window, where gamma is low, and every window meets expiry with full intervals. N = ceil(n/h) hedge intervals for a window of n trading-day steps.
 - Costs: c in {0, 1, 5, 25, 100} bp of notional traded, on every stock trade including the opening and closing trades. SPY's one-cent spread is about 0.2 bp, so this grid is a stress test.
-- Normalise every window's P&L by its initial premium C0.
+- Money units: P&L and predictors are in expiry money, as fractions of C0·G0, the premium carried to t_end, where G_j = exp(Σ_{i≥j} r_i·Δt_i) is the growth of cash from close j to t_end at the financing rates. Each predictor term is weighted by G at the rebalance close where its interval starts, which makes Σ G_k·Γ_k·S_k²·Δt_k an exact path version of G0·vega0/σ_i under Q (E[e^{-rt}·Γ_t·S_t²] = Γ0·S0²). Check: P&L and P_path/P_gap are unchanged to 1e-10 when a flat r = 0.05 is added in forward terms, which fails if P&L is divided by C0 alone.
+- Engine inputs: a window of n steps has S and t of shape (n + 1,) and step rates r of shape (n,) (r_j prices and hedges at close j and accrues cash from j to j + 1), or a scalar r. P windows of one length stack as (P, n + 1) and (P, n), each with its own calendar and rates, with σ_i, K and q scalar or (P,). Any other shape raises. Real windows differ in n, so simulate_windows groups them by n and calls the engine once per group.
+- Puts: the engine also prices and hedges puts. Check: at q = 0 (the Stage 5b configuration) and a flat r = 0.04, a hedged call and a hedged put with the same K give identical P&L path by path to 1e-10, because call minus put is a forward whose delta is exactly one share. Parity is not tested at q > 0: the total-return path pays no dividend while the model assumes one on the e^{-qτ} shares, so the two differ by that missing dividend, the same carry effect the section 4 carry check measures.
 - Realised variance: RV = Σ [ln(S_{j+1}/S_j)]² over daily closes in the window, no demeaning, no N - 1. σ_r² = RV/T0. Compare total variances: σ_i²·T0 against RV.
 
 Predictors (the R² ladder), computed on the same rebalancing grid as the actual P&L
 - P_gap = vega0·(σ_r² - σ_i²)/(2σ_i)
 - P_path = ½·(σ_r² - σ_i²)·Σ_j Γ_j·S_j²·Δt_j
 - P_step = Σ_j ½·Γ_j·S_j²·(R_j² - σ_i²·Δt_j), with R_j the simple return over hedge interval j
-- For each predictor report R²_45 = 1 - Σ(y - p)²/Σ(y - ȳ)² (about the 45 degree line) and OLS y = α + β·p with Newey-West (HAC, maxlags = 21) standard errors. Theory says α = 0, β = 1.
+- For each predictor report R²_45 = 1 - Σ(y - p)²/Σ(y - ȳ)² (about the 45 degree line) and OLS y = α + β·p. Theory says α = 0, β = 1.
+- Confidence intervals for R²_45 and β come from a moving block bootstrap over windows in start-date order, block length 42 windows (about two window lengths, so each block spans the overlap), alongside the non-overlapping subsample. This replaces Newey-West errors. The number of resamples and the seed are fixed in the Stage 5b plan.
 - The headline R² is P_gap's, because the research question asks about the vol gap. The ladder attributes the shortfall: moneyness drift (P_path vs P_gap), timing of moves against gamma (P_step vs P_path), discreteness and jumps (actual vs P_step).
-- Sanity ranges on synthetic GBM windows (verified; 3,000 windows, σ_i ~ lognormal(ln 0.17, 0.35), σ_true = σ_i·exp(N(-0.2, 0.3))): daily R²_45 = 0.77 / 0.93 / 0.98 for P_gap / P_path / P_step; every 5 days 0.40 / 0.46 / 0.92. Real data should sit lower on P_step because of jumps.
+- Benchmark: even on pure GBM windows (the synthetic set below, daily hedging), P_gap's R²_45 is only about 0.8 (0.77 below), because the vol gap alone ignores where the path spends its gamma. Real data is judged against this benchmark, not against 1.
+- Sanity ranges on synthetic GBM windows (verified; 3,000 windows, σ_i ~ lognormal(ln 0.17, 0.35), σ_true = σ_i·exp(N(-0.2, 0.3))): daily R²_45 = 0.77 / 0.93 / 0.98 for P_gap / P_path / P_step; every 5 days 0.41 / 0.45 / 0.89 (median of 40 seed pairs). Expiry anchoring puts a full 5-day interval where gamma peaks, so the quadratic approximation is worse; the start-anchored grid's 0.40 / 0.46 / 0.92 was flattered by its 1-day stub before expiry. Real data should sit lower on P_step because of jumps.
 - These ranges are illustrative and seed-dependent, so no test asserts them (section 4 tests only P_step R²_45 ≥ 0.95). Across 200 seed pairs the daily P_step median is 0.976, and a single large-move window can pull it down.
+- Weekday diagnostic (daily hedging): P_step residuals, the hedged P&L of each interval minus its P_step term, averaged by the weekday of the interval's closing day. Δt counts calendar days, so a Friday-to-Monday interval charges three days of σ_i² against roughly one trading day of realised variance; the diagnostic shows how much of the residual this weekend theta effect explains.
 
 Hedging error and Figure 8
 - e = P&L - P_gap per window. For each (h, c) report mean, std and RMSE = √(mean² + std²).
-- Figure 8: RMSE against N, one line per cost level, plus a panel with mean and std; overlay the synthetic GBM curve (σ_true = σ_i) as a reference.
+- Figure 8: RMSE against N, one line per cost level, plus a panel with mean and std; overlay the synthetic GBM curve (σ_true = σ_i) as a reference. N varies with window length, so the x-axis is the mean N per h across windows, with the range (minimum to maximum) shown.
 - The synthetic reference computes P_gap from each synthetic path's own realised variance, the same definition as on real data, so the curves are comparable. Also draw the known-vol Derman-Kamal curve (P_gap = 0) as a labelled dashed line.
-- Expected pattern (verified, synthetic): costs move the mean, not the spread. Daily std of P&L (the P_gap = 0 case) at 0 / 1 / 5 bp was 18.6% / 18.6% / 18.4% of premium. On RMSE, daily beats every-2-days and every-5-days up to 5 bp, ties every-2-days near 25 bp, and loses to every-5-days at 100 bp.
+- Expected pattern (verified, synthetic, and still true on the expiry-anchored grid). It refers to raw synthetic P&L with σ_true = σ_i; real data reports the same statistics for e = P&L - P_gap. Costs move the mean, not the spread. Daily std of P&L (the P_gap = 0 case) at 0 / 1 / 5 bp was 18.6% / 18.6% / 18.4% of premium. On RMSE, daily beats every-2-days and every-5-days up to 5 bp, ties every-2-days near 25 bp, and loses to every-5-days at 100 bp.
 
 Robustness
 - Exclude every window containing any trading day from 2025-04-03 to 2025-04-09 and rerun the ladder.
@@ -63,13 +68,13 @@ Robustness
 - Sensitivity: rerun with σ_i = VIX minus the variance-swap gap measured in section 8.
 
 ## 4. Discrete hedging checks (tests/test_hedging.py)
-Setup: GBM with σ_true = σ_i = 0.18, r = q = 0, S0 = 100, K = F0, T = 21/252, 21 daily steps, 200,000 paths, fixed seed.
+Setup: GBM with σ_true = σ_i = 0.18, r = q = 0, S0 = 100, K = F0, T = 21/252, 21 daily steps, 200,000 paths, fixed seed. With r = 0, C0·G0 = C0, so only the carry check depends on the money-unit convention.
 - Mean P&L/C0 within ±0.5% (verified -0.02%).
 - Std/C0 in [0.175, 0.200] (verified 0.187; Derman-Kamal √(π/4)·vega·σ/(√N·C0) = 0.193347, an asymptotic formula that overstates at small N).
-- Every 2 days: std/C0 about 0.252 (Derman-Kamal 0.273).
+- Every 2 days: std/C0 about 0.2566 (Derman-Kamal 0.273). The grid is anchored to expiry, so the one-day stub opens the window instead of sitting on the final day, where ATM gamma peaks; the start-anchored grid gave 0.252.
 - Mean interior turnover within 5% of √N/π = 1.458679 shares per option share (verified 1.417).
 - 5 bp, daily: mean -6.0% ± 0.5% of C0, std about 18.4%.
-- Carry consistency: a total-return path (drift r = 0.04, σ = 0.18) priced and hedged with q = 0.013 gives mean +2.70% ± 0.3% of C0; with q = 0 it gives 0 ± 0.3% (verified -0.08%). This guards against pairing adjusted closes with a dividend yield. The earlier +2.64% included sampling noise; +2.70% is the exact expectation with K = S0·exp((r - q)T), since the hedge has zero mean under Q whatever delta is used.
+- Carry consistency: a total-return path (drift r = 0.04, σ = 0.18) priced and hedged with q = 0.013 gives mean +2.69% ± 0.3% of C0·G0; with q = 0 it gives 0 ± 0.3% (verified -0.08%). This guards against pairing adjusted closes with a dividend yield. +2.69% is the exact expectation C(q = 0)/C(q) - 1 = 0.026907 with K = S0·exp((r - q)T), since the hedge has zero mean under Q whatever delta is used. It was +2.70% (e^{rT} times this) when P&L was divided by C0 without carrying it to expiry; the earlier +2.64% included sampling noise.
 - P_step R²_45 ≥ 0.95 on the synthetic window set in section 3 (verified 0.977).
 
 ## 5. Chain cleaning (Stage 2b)
@@ -122,10 +127,14 @@ Tables
 4. Hedging summary by h and c: mean, std, RMSE, the R² ladder with slopes, plus the robustness and sensitivity rows.
 
 ## 10. Limitations to state in README
-- Overlapping windows are not independent: report the non-overlapping subsample and HAC errors.
+- Overlapping windows are not independent: report the non-overlapping subsample and moving block bootstrap intervals.
 - SPY options are American; European pricing on OTM quotes leaves a small early-exercise bias, largest for long-dated puts.
 - VIX is a variance-swap level and sits above ATM vol by the section 8 gap; the sensitivity bounds its effect.
 - One snapshot: the surface describes a single moment.
 - Yahoo quotes are delayed about 15 minutes, and mids from wide markets are noisy.
 - The hedge is simplified: σ_i fixed, flat costs, no market impact, one rate for financing.
 - The Stage 5 option is written on the total-return series, so ex-dividend drops are absent by construction.
+- The option is struck and priced at the opening rate r0 while cash accrues at the daily rates, so rate moves within a window leave a small term in the P&L.
+- ^VIX closes at 16:15 ET, 15 minutes after SPY, so σ_i is observed slightly after the SPY close it is paired with.
+- Delta is computed from a close and traded at that same close, which assumes no execution lag.
+- P_gap is ex post by construction: it uses the window's own realised variance, so it attributes P&L after the fact and is not a forecast.

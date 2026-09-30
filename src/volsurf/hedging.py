@@ -1,19 +1,26 @@
 """Delta-hedging simulation and P&L attribution (DESIGN.md section 3).
 
 A window is a path of closes S_0, ..., S_n at times t_0 < ... < t_n (years,
-ACT/365). At the t_0 close the trader buys one European call struck at K at
-its Black-Scholes value with fixed implied vol sigma_i, and holds a short
-delta hedge that is reset every h closes and unwound at the t_n close, when
-the call pays max(S_n - K, 0). All cash (premium, stock trades, costs) sits in
-one account that accrues at the daily rate r_j from close j to close j + 1.
+ACT/365). At the t_0 close the trader buys one European call or put struck at
+K at its Black-Scholes value with fixed implied vol sigma_i, and holds -Delta
+shares: the hedge is set at the t_0 close and at every h-th close counted back
+from t_n, and unwound at the t_n close, when the option pays its payoff. All
+cash (premium, stock trades, costs) sits in one account; the step rate r_j
+prices and hedges at close j and accrues cash from close j to close j + 1.
+
+Money units: every quantity is measured at the t_n close (expiry money) and
+divided by C0·G_0, the premium carried to expiry, where G_j is the growth of
+one unit of cash from close j to close n at the step rates. Predictor terms of
+the hedge interval that starts at close k are weighted by G_k.
 
 The path is treated as a total-return series: no dividend cash flows are
 credited or charged. A dividend yield q, if given, enters pricing and Greeks
 only; Stage 5 uses q = 0 because yfinance adjusted closes already contain
 dividends.
 
-Every function works on the last axis and broadcasts over leading axes, so a
-single call can hedge many paths at once.
+Shapes: one window has S and t of shape (n + 1,) and r of shape (n,); P
+windows of the same length stack along a leading axis as (P, n + 1) and
+(P, n). Windows of different lengths go through simulate_windows.
 """
 
 from typing import NamedTuple
@@ -24,23 +31,25 @@ from volsurf.black_scholes import bs_delta, bs_gamma, bs_price, bs_vega
 
 
 class HedgeResult(NamedTuple):
-    """Output of simulate_window.
+    """Output of simulate_window and simulate_windows.
 
-    P&L quantities are fractions of C0 measured at the t_n close (forward
-    value), and pnl = payoff + premium + stock + financing + costs exactly.
+    P&L quantities are in expiry money as fractions of C0·G_0 (the premium
+    carried to expiry at the step rates), and
+    pnl = payoff + premium + stock + financing + costs exactly.
 
     Attributes
     ----------
     pnl : ndarray
         Final value of the hedged position.
     payoff : ndarray
-        Call payoff max(S_n - K, 0).
+        Option payoff, max(S_n - K, 0) for a call or max(K - S_n, 0) for a put.
     premium : ndarray
-        Premium paid at t_0, -C0 (so -1 in units of C0).
+        Premium paid at t_0 and carried to expiry, -C0·G_0 (so -1).
     stock : ndarray
-        Price P&L of the short stock, -sum_k Delta_k·(S_{k+1} - S_k).
+        Price P&L of the stock position, -sum_k Delta_k·(S_{k+1} - S_k).
     financing : ndarray
-        Interest earned (negative if paid) on the cash account.
+        Interest earned (negative if paid) on the stock-trade and cost cash
+        flows; the premium's interest is inside premium.
     costs : ndarray
         Transaction costs, -c times notional traded, on every trade.
     turnover : ndarray
@@ -48,18 +57,19 @@ class HedgeResult(NamedTuple):
         strictly between the opening and closing trades, in shares per
         option (not a fraction of C0).
     p_gap : ndarray
-        Vol-gap predictor vega_0·(sigma_r² - sigma_i²)/(2·sigma_i).
+        Vol-gap predictor G_0·vega_0·(sigma_r² - sigma_i²)/(2·sigma_i).
     p_path : ndarray
-        Gamma-path predictor ½·(sigma_r² - sigma_i²)·sum_k Gamma_k·S_k²·dt_k.
+        Gamma-path predictor ½·(sigma_r² - sigma_i²)·sum_k G_k·Gamma_k·S_k²·dt_k.
     p_step : ndarray
-        Step predictor sum_k ½·Gamma_k·S_k²·(R_k² - sigma_i²·dt_k).
+        Step predictor sum_k ½·G_k·Gamma_k·S_k²·(R_k² - sigma_i²·dt_k).
     rv : ndarray
         Realised total variance sum_j ln(S_{j+1}/S_j)² over daily closes
         (not annualised).
     c0 : ndarray
-        Initial premium C0 in currency units.
-    n_intervals : int
-        Number of hedge intervals N in the window.
+        Initial premium C0 in currency units at t_0.
+    n_intervals : int or ndarray of int
+        Number of hedge intervals N in the window (an array with one entry
+        per window from simulate_windows).
     """
 
     pnl: np.ndarray
@@ -74,7 +84,10 @@ class HedgeResult(NamedTuple):
     p_step: np.ndarray
     rv: np.ndarray
     c0: np.ndarray
-    n_intervals: int
+    n_intervals: int | np.ndarray
+
+
+_FIELDS = tuple(f for f in HedgeResult._fields if f != "n_intervals")
 
 
 def gbm_paths(S0, mu, sigma, t, n_paths, seed):
@@ -115,6 +128,11 @@ def gbm_paths(S0, mu, sigma, t, n_paths, seed):
 def hedge_grid(n_steps, h):
     """Indices of the closes where the hedge is set, plus the final close.
 
+    The grid is anchored to expiry: every interval has length h except the
+    first, which is shorter when h does not divide n. A stub therefore opens
+    the window, where gamma is low, rather than sitting on the final days,
+    where ATM gamma peaks.
+
     Parameters
     ----------
     n_steps : int
@@ -125,15 +143,15 @@ def hedge_grid(n_steps, h):
     Returns
     -------
     ndarray of int
-        [0, h, 2h, ...] (all below n) followed by n. Its length is N + 1,
-        where N = ceil(n/h) is the number of hedge intervals; the last
-        interval is shorter than h when h does not divide n.
+        [0, ..., n - 2h, n - h, n], holding 0 and every n - m·h above 0. Its
+        length is N + 1, where N = ceil(n/h) is the number of hedge
+        intervals.
     """
     if n_steps < 1:
         raise ValueError("a window needs at least one step")
     if h < 1:
         raise ValueError("rebalance interval h must be at least 1")
-    return np.append(np.arange(0, n_steps, h), n_steps)
+    return np.append(0, n_steps - np.arange(0, n_steps, h)[::-1])
 
 
 def r2_45(y, p):
@@ -157,58 +175,95 @@ def r2_45(y, p):
     return 1.0 - np.sum((y - p) ** 2) / np.sum((y - y.mean()) ** 2)
 
 
-def simulate_window(S, t, r, sigma_i, K, h, c, q=0.0):
-    """Delta-hedge a long European call along price paths.
+def _check_shape(x, name, allowed):
+    """Raise ValueError unless x.shape is one of the allowed shapes."""
+    allowed = list(dict.fromkeys(allowed))
+    if x.shape not in allowed:
+        options = " or ".join(str(s) for s in allowed)
+        raise ValueError(f"{name} must have shape {options}; got {x.shape}")
+
+
+def _validate_inputs(S, t, r, sigma_i, K, q):
+    """Cast the inputs of simulate_window to float arrays and check their shapes.
+
+    S fixes the layout: (n + 1,) for one window or (P, n + 1) for P windows.
+    t is (n + 1,) or (P, n + 1); r is a scalar, (n,) or (P, n); sigma_i, K
+    and q are scalars or (P,), and must be scalars when S is 1-D. Any other
+    shape raises ValueError, so a path axis can never be read as a time axis.
+
+    Returns
+    -------
+    S, t, r, sigma_i, K, q : ndarray
+        S and t of shape lead + (n + 1,), r of shape lead + (n,) and the
+        per-window inputs of shape lead, where lead is () or (P,).
+    """
+    S, t, r, sigma_i, K, q = (np.asarray(x, dtype=float) for x in (S, t, r, sigma_i, K, q))
+    if S.ndim not in (1, 2) or S.shape[-1] < 2:
+        raise ValueError(f"S must have shape (n + 1,) or (paths, n + 1) with n >= 1; got {S.shape}")
+    lead, n = S.shape[:-1], S.shape[-1] - 1
+    _check_shape(t, "t", [(n + 1,), lead + (n + 1,)])
+    _check_shape(r, "r", [(), (n,), lead + (n,)])
+    for x, name in ((sigma_i, "sigma_i"), (K, "K"), (q, "q")):
+        _check_shape(x, name, [(), lead])
+    t = np.broadcast_to(t, S.shape)
+    r = np.broadcast_to(r, lead + (n,))
+    sigma_i, K, q = (np.broadcast_to(x, lead) for x in (sigma_i, K, q))
+    return S, t, r, sigma_i, K, q
+
+
+def simulate_window(S, t, r, sigma_i, K, h, c, q=0.0, is_call=True):
+    """Delta-hedge a long European option along price paths of one length.
 
     Parameters
     ----------
-    S : array_like of shape (..., n + 1)
-        Closes S_0, ..., S_n (n >= 1); leading axes index paths.
-    t : array_like of shape (..., n + 1)
-        Increasing times of the closes in years (ACT/365); only differences
-        matter. The call expires at t_n, so T0 = t_n - t_0.
-    r : array_like, broadcastable to S
-        Continuously compounded rate observed at each close. r_j prices and
-        hedges at close j and accrues cash from close j to close j + 1
-        (r_n is unused).
-    sigma_i : array_like, broadcastable to S.shape[:-1]
+    S : array_like of shape (n + 1,) or (P, n + 1)
+        Closes S_0, ..., S_n (n >= 1) of one window, or of P windows.
+    t : array_like of shape (n + 1,) or (P, n + 1)
+        Increasing times of the closes in years (ACT/365), shared or one row
+        per window; only differences matter. The option expires at t_n, so
+        T0 = t_n - t_0.
+    r : float or array_like of shape (n,) or (P, n)
+        Continuously compounded step rates. r_j prices and hedges at close j
+        and accrues cash from close j to close j + 1; a scalar is a flat rate.
+    sigma_i : float or array_like of shape (P,)
         Implied vol as a decimal, fixed for the window.
-    K : array_like, broadcastable to S.shape[:-1]
+    K : float or array_like of shape (P,)
         Strike.
     h : int
-        Rebalance interval in closes: the hedge is set at closes 0, h, 2h, ...
-        below n and unwound at close n.
+        Rebalance interval in closes: the hedge is set at close 0 and at
+        closes n - h, n - 2h, ... above 0 (see hedge_grid), and unwound at
+        close n.
     c : float
         Proportional cost as a decimal fraction of notional traded
         (5 bp = 0.0005), charged on every trade including the opening and
         closing ones.
-    q : array_like, broadcastable to S.shape[:-1], default 0
+    q : float or array_like of shape (P,), default 0
         Dividend yield used in pricing and Greeks only (see module docstring).
+    is_call : bool, default True
+        True for a call, False for a put.
 
     Returns
     -------
     HedgeResult
-        P&L, its components and the three predictors, each a fraction of C0
-        with shape S.shape[:-1], plus turnover, rv, c0 and N. Delta and Gamma
-        at close k use sigma_i, rate r_k and remaining time t_n - t_k;
-        R_k = S_{k+1}/S_k - 1 and dt_k = t_{k+1} - t_k run over the hedge
-        grid, and sigma_r² = rv/T0.
+        P&L, its components and the three predictors, each in expiry money
+        as a fraction of C0·G_0 with shape () or (P,), plus turnover, rv, c0
+        and N. Delta and Gamma at close k use sigma_i, rate r_k and remaining
+        time t_n - t_k; R_k = S_{k+1}/S_k - 1 and dt_k = t_{k+1} - t_k run
+        over the hedge grid, and sigma_r² = rv/T0.
+
+    Raises
+    ------
+    ValueError
+        If a shape is not one listed above, or the times do not increase.
     """
-    S = np.asarray(S, dtype=float)
-    t = np.asarray(t, dtype=float)
-    r = np.asarray(r, dtype=float)
-    sigma_i, K, q = (np.asarray(x, dtype=float) for x in (sigma_i, K, q))
-    lead = np.broadcast_shapes(
-        S.shape[:-1], t.shape[:-1], r.shape[:-1], sigma_i.shape, K.shape, q.shape
-    )
-    shape = lead + S.shape[-1:]
-    S, t, r = (np.broadcast_to(x, shape) for x in (S, t, r))
-    sigma_i, K, q = (np.broadcast_to(x, lead) for x in (sigma_i, K, q))
+    S, t, r, sigma_i, K, q = _validate_inputs(S, t, r, sigma_i, K, q)
     if np.any(np.diff(t, axis=-1) <= 0):
         raise ValueError("times must be strictly increasing")
 
-    n = shape[-1] - 1
+    lead = S.shape[:-1]
+    n = S.shape[-1] - 1
     grid = hedge_grid(n, h)
+    set_closes = grid[:-1]
     n_intervals = grid.size - 1
     tau = t[..., -1:] - t  # remaining time at each close
     T0 = tau[..., 0]
@@ -216,52 +271,125 @@ def simulate_window(S, t, r, sigma_i, K, h, c, q=0.0):
 
     # Hedge grid: closes where the hedge is set (all but the last grid point).
     S_g, t_g = S[..., grid], t[..., grid]
-    S_set, tau_set, r_set = S_g[..., :-1], tau[..., grid[:-1]], r[..., grid[:-1]]
-    delta = bs_delta(S_set, strike, tau_set, r_set, div, sig, is_call=True)
+    S_set, tau_set, r_set = S_g[..., :-1], tau[..., set_closes], r[..., set_closes]
+    delta = bs_delta(S_set, strike, tau_set, r_set, div, sig, is_call)
     gamma = bs_gamma(S_set, strike, tau_set, r_set, div, sig)
-    c0 = bs_price(S[..., 0], K, T0, r[..., 0], q, sigma_i, is_call=True)
+    c0 = bs_price(S[..., 0], K, T0, r[..., 0], q, sigma_i, is_call)
     vega0 = bs_vega(S[..., 0], K, T0, r[..., 0], q, sigma_i)
+
+    # Growth G_j of one unit of cash from close j to close n; C0·G_0 is the unit.
+    log_growth = r * np.diff(t, axis=-1)
+    tail = np.cumsum(log_growth[..., ::-1], axis=-1)[..., ::-1]
+    growth = np.exp(np.concatenate([tail, np.zeros(lead + (1,))], axis=-1))
+    g0, g_set = growth[..., 0], growth[..., set_closes]
+    unit = c0 * g0
 
     # Stock position -Delta_k after each grid close, 0 after the unwind.
     position = np.concatenate([-delta, np.zeros(lead + (1,))], axis=-1)
     trade = np.diff(position, axis=-1, prepend=0.0)  # shares bought at each grid close
     cost_flow = -c * np.abs(trade) * S_g
-    payoff = np.maximum(S[..., -1] - K, 0.0)
+    omega = 1.0 if is_call else -1.0
+    payoff = np.maximum(omega * (S[..., -1] - K), 0.0)
     stock = -np.sum(delta * np.diff(S_g, axis=-1), axis=-1)  # = -sum(trade·S_g)
     costs = np.sum(cost_flow, axis=-1)
-
-    # Growth of one unit of cash from close j to close n.
-    log_growth = r[..., :-1] * np.diff(t, axis=-1)
-    tail = np.cumsum(log_growth[..., ::-1], axis=-1)[..., ::-1]
-    growth = np.exp(np.concatenate([tail, np.zeros(lead + (1,))], axis=-1))
     flow = -trade * S_g + cost_flow  # cash in at each grid close
-    financing = np.sum(flow * (growth[..., grid] - 1.0), axis=-1) - c0 * (growth[..., 0] - 1.0)
+    financing = np.sum(flow * (growth[..., grid] - 1.0), axis=-1)
 
-    pnl = payoff - c0 + stock + financing + costs
+    pnl = payoff - unit + stock + financing + costs
     turnover = np.sum(np.abs(trade[..., 1:-1]), axis=-1)
 
-    # Predictors on the hedge grid.
+    # Predictors on the hedge grid, each term carried to expiry.
     rv = np.sum(np.diff(np.log(S), axis=-1) ** 2, axis=-1)
     var_gap = rv / T0 - sigma_i**2
     dt_g = np.diff(t_g, axis=-1)
     ret_g = S_g[..., 1:] / S_g[..., :-1] - 1.0
-    dollar_gamma = gamma * S_set**2
-    p_gap = vega0 * var_gap / (2.0 * sigma_i)
+    dollar_gamma = g_set * gamma * S_set**2
+    p_gap = g0 * vega0 * var_gap / (2.0 * sigma_i)
     p_path = 0.5 * var_gap * np.sum(dollar_gamma * dt_g, axis=-1)
     p_step = 0.5 * np.sum(dollar_gamma * (ret_g**2 - sig**2 * dt_g), axis=-1)
 
     return HedgeResult(
-        pnl=pnl / c0,
-        payoff=payoff / c0,
+        pnl=pnl / unit,
+        payoff=payoff / unit,
         premium=-np.ones(lead),
-        stock=stock / c0,
-        financing=financing / c0,
-        costs=costs / c0,
+        stock=stock / unit,
+        financing=financing / unit,
+        costs=costs / unit,
         turnover=turnover,
-        p_gap=p_gap / c0,
-        p_path=p_path / c0,
-        p_step=p_step / c0,
+        p_gap=p_gap / unit,
+        p_path=p_path / unit,
+        p_step=p_step / unit,
         rv=rv,
         c0=c0,
         n_intervals=n_intervals,
     )
+
+
+def simulate_windows(S, t, r, starts, ends, sigma_i, K, h, c, q=0.0, is_call=True):
+    """Delta-hedge windows of one history, calling simulate_window once per length.
+
+    Real windows span a fixed number of calendar days, so their number of
+    trading-day steps n varies. Windows are grouped by n, each group is
+    stacked into (P, n + 1) arrays with its own calendar and rates, and the
+    results are returned in the order the windows were given.
+
+    Parameters
+    ----------
+    S, t, r : array_like of shape (M,)
+        History of closes, their times in years (ACT/365) and the
+        continuously compounded rate at each close.
+    starts, ends : array_like of int, shape (W,)
+        Window w runs from close starts[w] to close ends[w], with
+        0 <= starts[w] < ends[w] < M, so it has n_w = ends[w] - starts[w]
+        steps and step rates r[starts[w]:ends[w]].
+    sigma_i, K : float or array_like of shape (W,)
+        Implied vol (decimal) and strike of each window.
+    h, c, is_call
+        As in simulate_window.
+    q : float or array_like of shape (W,), default 0
+        As in simulate_window.
+
+    Returns
+    -------
+    HedgeResult
+        Every field has shape (W,) in window order; n_intervals is an int
+        array.
+
+    Raises
+    ------
+    ValueError
+        If the history, the bounds or a per-window input has the wrong shape
+        or type, or a window is empty or out of range.
+    """
+    S, t, r = (np.asarray(x, dtype=float) for x in (S, t, r))
+    if S.ndim != 1 or t.shape != S.shape or r.shape != S.shape:
+        raise ValueError("S, t and r must be 1-D histories of the same length")
+    starts, ends = np.asarray(starts), np.asarray(ends)
+    if starts.ndim != 1 or ends.shape != starts.shape:
+        raise ValueError("starts and ends must be 1-D arrays of the same length")
+    if not (np.issubdtype(starts.dtype, np.integer) and np.issubdtype(ends.dtype, np.integer)):
+        raise ValueError("starts and ends must be integer indices")
+    if np.any(starts < 0) or np.any(ends <= starts) or np.any(ends >= S.size):
+        raise ValueError("every window needs 0 <= start < end < len(S)")
+
+    n_windows = starts.size
+    per_window = []
+    for x, name in ((sigma_i, "sigma_i"), (K, "K"), (q, "q")):
+        x = np.asarray(x, dtype=float)
+        _check_shape(x, name, [(), (n_windows,)])
+        per_window.append(np.broadcast_to(x, (n_windows,)))
+    sigma_i, K, q = per_window
+
+    lengths = ends - starts
+    out = {name: np.empty(n_windows) for name in _FIELDS}
+    n_intervals = np.empty(n_windows, dtype=int)
+    for n in np.unique(lengths):
+        rows = np.flatnonzero(lengths == n)
+        closes = starts[rows, None] + np.arange(n + 1)
+        res = simulate_window(
+            S[closes], t[closes], r[closes[:, :-1]], sigma_i[rows], K[rows], h, c, q[rows], is_call
+        )
+        for name in _FIELDS:
+            out[name][rows] = getattr(res, name)
+        n_intervals[rows] = res.n_intervals
+    return HedgeResult(**out, n_intervals=n_intervals)

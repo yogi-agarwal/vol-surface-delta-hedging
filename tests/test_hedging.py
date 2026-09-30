@@ -6,7 +6,14 @@ import numpy as np
 import pytest
 
 from volsurf.black_scholes import bs_delta, bs_gamma, bs_price, bs_vega
-from volsurf.hedging import gbm_paths, hedge_grid, r2_45, simulate_window
+from volsurf.hedging import (
+    HedgeResult,
+    gbm_paths,
+    hedge_grid,
+    r2_45,
+    simulate_window,
+    simulate_windows,
+)
 
 # ---------------------------------------------------------------------------
 # Setup (DESIGN.md section 4)
@@ -23,6 +30,8 @@ SEED_FLAT = 1  # r = 0 paths for the frictionless and cost checks
 SEED_DRIFT = 2  # drift r = 0.04 paths for the carry check
 SEED_SET_VOLS = 3  # sigma_i and sigma_true draws for the synthetic window set
 SEED_SET_PATHS = 4  # paths for the synthetic window set
+
+FIELDS = [f for f in HedgeResult._fields if f != "n_intervals"]
 
 
 @pytest.fixture(scope="module")
@@ -81,8 +90,14 @@ def test_hedge_grid(h, n_intervals):
     grid = hedge_grid(21, h)
     assert grid.size - 1 == n_intervals
     assert grid[0] == 0 and grid[-1] == 21
-    np.testing.assert_array_equal(np.diff(grid[:-1]), h)
-    assert 0 < grid[-1] - grid[-2] <= h
+    np.testing.assert_array_equal(np.diff(grid[1:]), h)  # full intervals up to expiry
+    assert 0 < grid[1] - grid[0] <= h  # any stub opens the window
+
+
+def test_hedge_grid_is_anchored_to_expiry():
+    np.testing.assert_array_equal(hedge_grid(21, 5), [0, 1, 6, 11, 16, 21])
+    np.testing.assert_array_equal(hedge_grid(21, 2)[:3], [0, 1, 3])
+    np.testing.assert_array_equal(hedge_grid(21, 7), [0, 7, 14, 21])
 
 
 def test_hedge_grid_rejects_bad_input():
@@ -105,24 +120,31 @@ def test_r2_45():
 # Engine mechanics against an explicit day-by-day cash account
 # ---------------------------------------------------------------------------
 
-def _reference_window(S, t, r, sigma, K, h, c, q):
-    """Loop over closes: accrue cash, rebalance on grid days, unwind at the end."""
+def _reference_window(S, t, r, sigma, K, h, c, q, is_call=True):
+    """Loop over closes: accrue cash, rebalance on grid days, unwind at the end.
+
+    r holds one rate per step. The premium is carried to expiry in its own
+    account, so financing is the interest on the hedge cash alone, and every
+    result is divided by that carried premium.
+    """
     n = len(S) - 1
     expiry = t[-1]
-    c0 = bs_price(S[0], K, expiry - t[0], r[0], q, sigma)
-    cash, position = -c0, 0.0
+    c0 = bs_price(S[0], K, expiry - t[0], r[0], q, sigma, is_call)
+    premium, cash, position = c0, 0.0, 0.0
     stock = financing = costs = turnover = 0.0
     set_days = []
     for j in range(n + 1):
         if j > 0:
-            interest = cash * (math.exp(r[j - 1] * (t[j] - t[j - 1])) - 1.0)
+            step_growth = math.exp(r[j - 1] * (t[j] - t[j - 1]))
+            premium *= step_growth
+            interest = cash * (step_growth - 1.0)
             financing += interest
             cash += interest
             stock += position * (S[j] - S[j - 1])
         if j == n:
             target = 0.0
-        elif j % h == 0:
-            target = -bs_delta(S[j], K, expiry - t[j], r[j], q, sigma)
+        elif j == 0 or (n - j) % h == 0:
+            target = -bs_delta(S[j], K, expiry - t[j], r[j], q, sigma, is_call)
             set_days.append(j)
         else:
             target = position
@@ -133,30 +155,34 @@ def _reference_window(S, t, r, sigma, K, h, c, q):
         cash -= trade * S[j] + cost
         costs -= cost
         position = target
-    payoff = max(S[n] - K, 0.0)
-    pnl = cash + payoff
+    payoff = max(S[n] - K, 0.0) if is_call else max(K - S[n], 0.0)
+    pnl = cash + payoff - premium
+
+    def to_expiry(a):
+        """Growth of one unit of cash from close a to close n, day by day."""
+        return math.prod(math.exp(r[j] * (t[j + 1] - t[j])) for j in range(a, n))
 
     rv = sum(math.log(S[j + 1] / S[j]) ** 2 for j in range(n))
     var_gap = rv / (expiry - t[0]) - sigma**2
     ends = set_days[1:] + [n]
     p_path = p_step = 0.0
     for a, b in zip(set_days, ends):
-        dollar_gamma = bs_gamma(S[a], K, expiry - t[a], r[a], q, sigma) * S[a] ** 2
+        dollar_gamma = to_expiry(a) * bs_gamma(S[a], K, expiry - t[a], r[a], q, sigma) * S[a] ** 2
         dt = t[b] - t[a]
         p_path += 0.5 * var_gap * dollar_gamma * dt
         p_step += 0.5 * dollar_gamma * ((S[b] / S[a] - 1.0) ** 2 - sigma**2 * dt)
     vega0 = bs_vega(S[0], K, expiry - t[0], r[0], q, sigma)
-    p_gap = vega0 * var_gap / (2 * sigma)
+    p_gap = to_expiry(0) * vega0 * var_gap / (2 * sigma)
     return {
-        "pnl": pnl / c0,
-        "payoff": payoff / c0,
-        "stock": stock / c0,
-        "financing": financing / c0,
-        "costs": costs / c0,
+        "pnl": pnl / premium,
+        "payoff": payoff / premium,
+        "stock": stock / premium,
+        "financing": financing / premium,
+        "costs": costs / premium,
         "turnover": turnover,
-        "p_gap": p_gap / c0,
-        "p_path": p_path / c0,
-        "p_step": p_step / c0,
+        "p_gap": p_gap / premium,
+        "p_path": p_path / premium,
+        "p_step": p_step / premium,
         "rv": rv,
         "c0": c0,
     }
@@ -164,7 +190,7 @@ def _reference_window(S, t, r, sigma, K, h, c, q):
 
 @pytest.fixture(scope="module")
 def uneven_window():
-    """Five paths on an irregular calendar grid with daily rates and per-path inputs."""
+    """Five paths on an irregular calendar grid with daily step rates and per-path inputs."""
     days = np.array([0, 1, 2, 3, 6, 7, 8, 9, 10, 13, 14])  # weekends skipped
     t = days / 365
     rng = np.random.default_rng(7)
@@ -173,17 +199,18 @@ def uneven_window():
     S = gbm_paths(400.0, 0.03, sigma * 1.3, t, 5, seed=8)
     K = np.array([380.0, 400.0, 405.0, 420.0, 401.0])
     q = np.array([0.0, 0.013, 0.0, 0.02, 0.0])
-    return S, t, r, sigma, K, q
+    return S, t, r[:-1], sigma, K, q  # one rate per step; the rate at the last close is never used
 
 
+@pytest.mark.parametrize("is_call", [True, False])
 @pytest.mark.parametrize("h", [1, 3, 4, 10, 12])
-def test_matches_reference_loop(uneven_window, h):
+def test_matches_reference_loop(uneven_window, h, is_call):
     S, t, r, sigma, K, q = uneven_window
     c = 0.0025
-    res = simulate_window(S, t, r, sigma, K, h=h, c=c, q=q)
+    res = simulate_window(S, t, r, sigma, K, h=h, c=c, q=q, is_call=is_call)
     assert res.n_intervals == hedge_grid(len(t) - 1, h).size - 1
     for i in range(S.shape[0]):
-        ref = _reference_window(S[i], t, r, sigma[i], K[i], h, c, q[i])
+        ref = _reference_window(S[i], t, r, sigma[i], K[i], h, c, q[i], is_call)
         for name, value in ref.items():
             assert getattr(res, name)[i] == pytest.approx(value, rel=1e-12, abs=1e-14), name
 
@@ -218,6 +245,118 @@ def test_rejects_non_increasing_times():
 
 
 # ---------------------------------------------------------------------------
+# Input shapes and windows of different lengths
+# ---------------------------------------------------------------------------
+
+def test_per_window_times_and_rates(uneven_window):
+    # Each path gets its own calendar and rates, as real windows starting on different days do.
+    S, t, r, sigma, K, q = uneven_window
+    times = t * (1.0 + 0.1 * np.arange(5))[:, None] + 0.5
+    rates = r + 0.002 * np.arange(5)[:, None]
+    assert times.shape == (5, 11) and rates.shape == (5, 10)
+    res = simulate_window(S, times, rates, sigma, K, h=3, c=0.0005, q=q)
+    for i in range(5):
+        one = simulate_window(S[i], times[i], rates[i], sigma[i], K[i], h=3, c=0.0005, q=q[i])
+        for name in FIELDS:
+            assert getattr(res, name)[i] == pytest.approx(getattr(one, name), rel=1e-14, abs=1e-15), name
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        pytest.param(lambda S, t, r: {"r": np.append(r, r[-1])}, id="r per close"),
+        pytest.param(lambda S, t, r: {"r": np.full(5, 0.03)}, id="r per path"),
+        pytest.param(lambda S, t, r: {"r": np.tile(r, (4, 1))}, id="r wrong path count"),
+        pytest.param(lambda S, t, r: {"r": r[None, None, :]}, id="r 3-D"),
+        pytest.param(lambda S, t, r: {"t": t[:-1]}, id="t wrong length"),
+        pytest.param(lambda S, t, r: {"t": np.tile(t, (4, 1))}, id="t wrong path count"),
+        pytest.param(lambda S, t, r: {"sigma_i": np.full(11, 0.2)}, id="sigma_i per close"),
+        pytest.param(lambda S, t, r: {"sigma_i": np.full((5, 1), 0.2)}, id="sigma_i 2-D"),
+        pytest.param(lambda S, t, r: {"K": np.full(6, 400.0)}, id="K wrong path count"),
+        pytest.param(lambda S, t, r: {"q": np.zeros((5, 10))}, id="q 2-D"),
+        pytest.param(lambda S, t, r: {"S": S[None]}, id="S 3-D"),
+        pytest.param(lambda S, t, r: {"S": S[:, :1], "t": t[:1], "r": 0.03}, id="single close"),
+        pytest.param(
+            lambda S, t, r: {"S": S[0], "sigma_i": np.full(5, 0.2), "K": 400.0, "q": 0.0},
+            id="per-path sigma_i with one path",
+        ),
+    ],
+)
+def test_rejects_ambiguous_shapes(uneven_window, bad):
+    S, t, r, sigma, K, q = uneven_window
+    args = {"S": S, "t": t, "r": r, "sigma_i": sigma, "K": K, "q": q}
+    args.update(bad(S, t, r))
+    with pytest.raises(ValueError):
+        simulate_window(h=2, c=0.0, **args)
+
+
+def test_simulate_windows_groups_by_length(uneven_window):
+    S, t, r, sigma, K, _ = uneven_window
+    history, rates = S[0], np.append(r, r[-1])  # one rate per close; no window reads the last
+    starts = np.array([0, 1, 2, 3, 5])
+    ends = np.array([4, 6, 6, 10, 9])  # lengths 4, 5, 4, 7, 4
+    q = 0.013
+    res = simulate_windows(history, t, rates, starts, ends, sigma, K, h=2, c=0.001, q=q)
+    assert res.pnl.shape == (5,)
+    for w, (a, b) in enumerate(zip(starts, ends)):
+        one = simulate_window(
+            history[a : b + 1], t[a : b + 1], rates[a:b], sigma[w], K[w], h=2, c=0.001, q=q
+        )
+        assert res.n_intervals[w] == one.n_intervals
+        for name in FIELDS:
+            assert getattr(res, name)[w] == pytest.approx(getattr(one, name), rel=1e-14, abs=1e-15), name
+
+
+@pytest.mark.parametrize(
+    "starts, ends",
+    [([0, 3], [4, 3]), ([0], [11]), ([-1], [4]), ([0.0], [4.0]), ([0, 1], [4])],
+    ids=["empty window", "past the end", "negative start", "float bounds", "length mismatch"],
+)
+def test_simulate_windows_rejects_bad_bounds(uneven_window, starts, ends):
+    S, t, r, *_ = uneven_window
+    with pytest.raises(ValueError):
+        simulate_windows(S[0], t, np.append(r, r[-1]), starts, ends, 0.2, 400.0, h=1, c=0.0)
+
+
+# ---------------------------------------------------------------------------
+# Money units and puts
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("h", [1, 3])
+def test_money_units_invariant_to_deterministic_rate(uneven_window, h):
+    # With a flat rate r, the window S' = S·exp(r(t - t0)), K' = K·exp(r·T0) is the r = 0
+    # window in forward terms: deltas, C0 and vega0 are unchanged, and every cash flow and
+    # dollar-gamma term carried to expiry scales by exp(r·T0). P&L over C0 grown to expiry,
+    # and predictors weighted by growth to expiry, must therefore agree. Dividing by C0
+    # alone, or leaving the predictor terms unweighted, misses by about 0.4% at r = 0.05.
+    S, t, _, sigma, K, q = uneven_window
+    r, c = 0.05, 5e-4
+    T0 = t[-1] - t[0]
+    base = simulate_window(S, t, 0.0, sigma, K, h=h, c=c, q=q)
+    fwd = simulate_window(S * np.exp(r * (t - t[0])), t, r, sigma, K * math.exp(r * T0), h=h, c=c, q=q)
+    pnl_gap = np.max(np.abs(fwd.pnl - base.pnl))
+    ratio_gap = np.max(np.abs(fwd.p_path / fwd.p_gap / (base.p_path / base.p_gap) - 1.0))
+    print(f"h = {h}: max |pnl' - pnl| = {pnl_gap:.1e}, max P_path/P_gap relative gap = {ratio_gap:.1e}")
+    np.testing.assert_allclose(fwd.c0, base.c0, rtol=1e-12)
+    np.testing.assert_allclose(fwd.pnl, base.pnl, rtol=0, atol=1e-10)
+    np.testing.assert_allclose(fwd.p_path / fwd.p_gap, base.p_path / base.p_gap, rtol=1e-10)
+
+
+@pytest.mark.parametrize("h", [1, 3, 10])
+def test_hedged_call_put_parity(uneven_window, h):
+    # Long call minus long put is a forward whose delta is exactly one share when q = 0, so the
+    # two hedged positions differ by a hedged forward, which earns nothing at a flat rate. Their
+    # P&L carried to expiry, pnl·C0·G0 with G0 common to both, must agree path by path. Costs are
+    # off because the opening and closing trades differ in size.
+    S, t, _, sigma, K, _ = uneven_window
+    call = simulate_window(S, t, 0.04, sigma, K, h=h, c=0.0, q=0.0, is_call=True)
+    put = simulate_window(S, t, 0.04, sigma, K, h=h, c=0.0, q=0.0, is_call=False)
+    gap = (call.pnl * call.c0 - put.pnl * put.c0) / call.c0
+    print(f"h = {h}: max |call - put| hedged P&L = {np.max(np.abs(gap)):.1e} of C0·G0")
+    np.testing.assert_allclose(gap, 0.0, rtol=0, atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
 # Discrete hedging checks (DESIGN.md section 4)
 # ---------------------------------------------------------------------------
 
@@ -236,14 +375,15 @@ def test_daily_std_pnl(daily):
 
 
 def test_every_2_days_std_pnl(flat_paths):
-    # DESIGN.md gives "about 0.252"; tolerance 0.005 is several Monte Carlo
-    # standard errors yet excludes the Derman-Kamal value 0.273.
+    # DESIGN.md gives "about 0.2566" on the expiry-anchored grid (one-day stub
+    # first); tolerance 0.005 is several Monte Carlo standard errors yet
+    # excludes the Derman-Kamal value 0.273.
     res = simulate_window(flat_paths, TIMES, 0.0, SIGMA, S0, h=2, c=0.0)
     std = res.pnl.std()
     dk = _derman_kamal(21 / 2)  # asymptotic formula with interval 2/252
     print(f"every-2-days std P&L/C0 = {std:.5f}, Derman-Kamal = {dk:.6f}")
     assert dk == pytest.approx(0.273, abs=5e-4)
-    assert std == pytest.approx(0.252, abs=0.005)
+    assert std == pytest.approx(0.2566, abs=0.005)
 
 
 def test_daily_interior_turnover(daily):
@@ -263,15 +403,19 @@ def test_daily_5bp_costs(flat_paths):
     assert std == pytest.approx(0.184, abs=0.005)
 
 
-@pytest.mark.parametrize("q, expected", [(0.013, 0.0270), (0.0, 0.0)])
-def test_carry_consistency(q, expected):
+@pytest.mark.parametrize("q, expected, exact_value", [(0.013, 0.0269, 0.026907), (0.0, 0.0, 0.0)])
+def test_carry_consistency(q, expected, exact_value):
     # Total-return path with drift r; K is the pricing model's forward S0·exp((r - q)T).
+    # The hedge has zero mean under Q whatever delta is used, so the mean P&L over C0
+    # grown to expiry is exactly C(q = 0)/C(q) - 1.
     r = 0.04
     paths = gbm_paths(S0, r, SIGMA, TIMES, N_PATHS, seed=SEED_DRIFT)
     K = S0 * math.exp((r - q) * T)
+    exact = bs_price(S0, K, T, r, 0.0, SIGMA) / bs_price(S0, K, T, r, q, SIGMA) - 1.0
     res = simulate_window(paths, TIMES, r, SIGMA, K, h=1, c=0.0, q=q)
     mean = res.pnl.mean()
-    print(f"carry q = {q}: mean P&L/C0 = {mean:.5f}")
+    print(f"carry q = {q}: mean P&L/(C0·G0) = {mean:.6f}, exact = {exact:.6f}")
+    assert exact == pytest.approx(exact_value, abs=5e-7)
     assert mean == pytest.approx(expected, abs=0.003)
 
 
