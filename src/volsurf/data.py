@@ -8,7 +8,7 @@ sigma_i  : ^VIX close / 100; forward-filled on SPY trading days when VIX is
 r        : continuously compounded rate irx_to_rate(d), where d = ^IRX
            close / 100 is the 13-week bill discount yield, forward-filled on
            SPY trading days
-Index    : DatetimeIndex of SPY trading days, UTC-normalised
+Index    : DatetimeIndex of SPY trading days at midnight, tz-naive
 
 data/frozen/history.parquet stores d itself in column r; load_history
 converts it on every load, so the frozen file never needs re-downloading.
