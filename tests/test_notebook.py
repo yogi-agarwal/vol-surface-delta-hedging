@@ -10,10 +10,21 @@ import volsurf.data
 
 NOTEBOOK = pathlib.Path(__file__).resolve().parents[1] / "notebooks" / "analysis.ipynb"
 LONG_DECIMAL = re.compile(r"(?<![\w.])[-+]?\d*\.\d{5,}(?:[eE][-+]?\d+)?")  # 5 or more decimals
+# Calls that would show OptionMetrics rows: the frame itself, or its first rows or full text.
+ROW_DISPLAY = re.compile(r"\b(?:display|print)\(\s*om\b|\.head\(|\.to_string\(")
 
 
 def _cells():
     return json.loads(NOTEBOOK.read_text(encoding="utf-8"))["cells"]
+
+
+def _stage_5c_sources():
+    """Sources of the Stage 5c code cells, keyed by cell id."""
+    return {
+        cell["id"]: "".join(cell["source"])
+        for cell in _cells()
+        if cell["cell_type"] == "code" and cell.get("id", "").startswith("stage-5c")
+    }
 
 
 def _output_texts(cell):
@@ -30,11 +41,7 @@ def _output_texts(cell):
 
 def test_stage_5c_skips_without_optionmetrics(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(volsurf.data, "_RAW", tmp_path)  # an empty data/raw/, as on a clean install
-    sources = [
-        "".join(cell["source"])
-        for cell in _cells()
-        if cell["cell_type"] == "code" and cell.get("id", "").startswith("stage-5c")
-    ]
+    sources = list(_stage_5c_sources().values())
     assert len(sources) >= 4
 
     # A fresh namespace without the Stage 5b names: any unguarded use of them raises NameError.
@@ -44,6 +51,18 @@ def test_stage_5c_skips_without_optionmetrics(tmp_path, monkeypatch, capsys):
     lines = capsys.readouterr().out.splitlines()
     assert len(lines) == 1
     assert lines[0].startswith("Stage 5c skipped")
+
+
+def test_stage_5c_cells_never_show_optionmetrics_rows():
+    # Static licensing guard on the code itself, so it holds with or without the files.
+    sources = _stage_5c_sources()
+    assert len(sources) >= 4
+    offending = [cell_id for cell_id, source in sources.items() if ROW_DISPLAY.search(source)]
+    assert not offending, f"cells {offending} display OptionMetrics rows"
+    # The pattern catches what it is meant to catch.
+    for call in ("display(om)", "print(om.loc['2024'])", "x.head()", "om.to_string()"):
+        assert ROW_DISPLAY.search(call), call
+    assert not ROW_DISPLAY.search('print(f"OptionMetrics: {om.index.size} dates")')
 
 
 def test_outputs_hold_no_optionmetrics_iv():
