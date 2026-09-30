@@ -3,16 +3,29 @@
 import math
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from volsurf.black_scholes import bs_delta, bs_gamma, bs_price, bs_vega
+from volsurf.data import load_history
 from volsurf.hedging import (
     HedgeResult,
+    block_bootstrap_indices,
+    derman_kamal,
     gbm_paths,
     hedge_grid,
+    hedging_error_stats,
+    non_overlapping,
+    ols_line,
     r2_45,
+    r2_ladder,
+    simulate_gbm_windows,
     simulate_window,
     simulate_windows,
+    study_windows,
+    synthetic_window_set,
+    weekday_diagnostic,
+    windows_containing,
 )
 
 # ---------------------------------------------------------------------------
@@ -50,7 +63,7 @@ def _derman_kamal(n_intervals):
     """Asymptotic std/C0 of discrete hedging, √(π/4)·vega·σ/(√N·C0), for the ATM call."""
     c0 = bs_price(S0, S0, T, 0.0, 0.0, SIGMA)
     vega = bs_vega(S0, S0, T, 0.0, 0.0, SIGMA)
-    return math.sqrt(math.pi / 4) * vega * SIGMA / (math.sqrt(n_intervals) * c0)
+    return derman_kamal(n_intervals, vega, SIGMA, c0)
 
 
 # ---------------------------------------------------------------------------
@@ -465,11 +478,255 @@ def test_carry_consistency(q, expected, exact_value):
 def test_p_step_r2_on_synthetic_window_set():
     # DESIGN.md section 3: 3,000 windows, sigma_i ~ lognormal(ln 0.17, 0.35),
     # sigma_true = sigma_i·exp(N(-0.2, 0.3)), daily hedging, r = q = 0, K = F0.
-    rng = np.random.default_rng(SEED_SET_VOLS)
-    sigma_i = np.exp(rng.normal(math.log(0.17), 0.35, 3000))
-    sigma_true = sigma_i * np.exp(rng.normal(-0.2, 0.3, 3000))
-    paths = gbm_paths(S0, 0.0, sigma_true, TIMES, 3000, seed=SEED_SET_PATHS)
-    res = simulate_window(paths, TIMES, 0.0, sigma_i, S0, h=1, c=0.0)
+    paths, times, sigma_i = synthetic_window_set(3000, SEED_SET_VOLS, SEED_SET_PATHS)
+    np.testing.assert_array_equal(times, TIMES)
+    res = simulate_window(paths, times, 0.0, sigma_i, S0, h=1, c=0.0)
     ladder = [r2_45(res.pnl, p) for p in (res.p_gap, res.p_path, res.p_step)]
     print("daily R2_45 P_gap / P_path / P_step = " + " / ".join(f"{x:.4f}" for x in ladder))
     assert ladder[2] >= 0.95
+
+
+def test_synthetic_window_set():
+    S, t, sigma_i = synthetic_window_set(50, 3, 4)
+    assert S.shape == (50, 22) and t.shape == (22,) and sigma_i.shape == (50,)
+    np.testing.assert_array_equal(S[:, 0], 100.0)
+    rng = np.random.default_rng(3)
+    np.testing.assert_allclose(sigma_i, np.exp(rng.normal(math.log(0.17), 0.35, 50)), rtol=1e-15)
+    np.testing.assert_array_equal(S, synthetic_window_set(50, 3, 4)[0])
+
+
+# ---------------------------------------------------------------------------
+# GBM paths on real calendars
+# ---------------------------------------------------------------------------
+
+def test_gbm_paths_per_path_grids_and_drift():
+    t = np.array([[0, 1, 2, 5, 6], [0, 3, 4, 5, 6]]) / 365
+    mu = np.array([[0.01, 0.02, 0.03, 0.04], [0.05, 0.0, -0.01, 0.02]])
+    paths = gbm_paths(S0, mu, np.zeros(2), t, 2, seed=0)
+    growth = np.cumsum(mu * np.diff(t, axis=-1), axis=-1)
+    np.testing.assert_allclose(paths[:, 1:], S0 * np.exp(growth), rtol=1e-14)
+    # Identical rows of a 2-D grid, with a per-step drift, reproduce the 1-D grid.
+    one = gbm_paths(S0, 0.03, SIGMA, TIMES, 4, seed=[9, 1])
+    two = gbm_paths(S0, np.full((4, 21), 0.03), SIGMA, np.tile(TIMES, (4, 1)), 4, seed=[9, 1])
+    np.testing.assert_allclose(two, one, rtol=1e-14)
+
+
+@pytest.fixture(scope="module")
+def calendar_history():
+    """Business days from late September 2021 to mid January 2022, less two holidays."""
+    dates = pd.bdate_range("2021-09-27", "2022-01-14")
+    dates = dates[~dates.isin(pd.to_datetime(["2021-11-25", "2021-12-24"]))]
+    rng = np.random.default_rng(10)
+    return pd.DataFrame(
+        {
+            "spy": 400.0 * np.exp(np.cumsum(0.01 * rng.standard_normal(dates.size))),
+            "sigma_i": 0.15 + 0.05 * rng.random(dates.size),
+            "r": 0.03 + 0.01 * rng.random(dates.size),
+        },
+        index=dates,
+    )
+
+
+def test_simulate_gbm_windows_matches_engine(calendar_history):
+    # One window of each length, so each length group holds one window and its paths can be
+    # redrawn here with the documented seed [seed, n].
+    win = study_windows(calendar_history)
+    r = calendar_history["r"].to_numpy()
+    lengths = win.ends - win.starts
+    sel = np.array([np.flatnonzero(lengths == n)[0] for n in np.unique(lengths)])
+    assert sel.size >= 2
+    starts, ends, sigma_i = win.starts[sel], win.ends[sel], win.sigma_i[sel]
+    sigma_true = np.linspace(0.1, 0.3, sel.size)
+    n_paths, h, c = 3, 2, 5e-4
+    res = simulate_gbm_windows(win.t, r, starts, ends, sigma_true, sigma_i, h, c, n_paths, seed=15)
+    n_max = res.interval_pnl.shape[-1]
+    assert res.pnl.shape == (sel.size, n_paths) and res.interval_pnl.shape == (sel.size, n_paths, n_max)
+    for w, (a, b) in enumerate(zip(starts, ends)):
+        times, rates = np.tile(win.t[a : b + 1], (n_paths, 1)), np.tile(r[a:b], (n_paths, 1))
+        paths = gbm_paths(100.0, rates, np.full(n_paths, sigma_true[w]), times, n_paths, seed=[15, b - a])
+        strike = 100.0 * math.exp(r[a] * (win.t[b] - win.t[a]))
+        one = simulate_window(paths, times, rates, sigma_i[w], strike, h, c)
+        assert res.n_intervals[w] == one.n_intervals
+        for name in FIELDS:
+            np.testing.assert_allclose(getattr(res, name)[w], getattr(one, name), rtol=1e-14, atol=1e-15, err_msg=name)
+        pad = n_max - one.n_intervals
+        for name in INTERVAL_FIELDS:
+            assert np.isnan(getattr(res, name)[w, :, :pad]).all()
+            np.testing.assert_allclose(getattr(res, name)[w, :, pad:], getattr(one, name), rtol=1e-14, atol=1e-15)
+
+
+# ---------------------------------------------------------------------------
+# Windows and subsamples of the real-data study
+# ---------------------------------------------------------------------------
+
+def _check_window_rules(history, win, first_start):
+    """Assert the DESIGN.md section 3 window rules for windows built from history."""
+    dates = history.index
+    assert dates[win.starts[0]] == dates[dates >= first_start][0]
+    np.testing.assert_array_equal(np.diff(win.starts), 1)  # one window per trading day
+    horizon = dates[win.starts] + pd.Timedelta(days=30)
+    assert (dates[win.ends] <= horizon).all()
+    inside = win.ends + 1 < dates.size
+    assert (dates[win.ends[inside] + 1] > horizon[inside]).all()  # t_end is the last day on or before
+    assert horizon[-1] <= dates[-1] < dates[win.starts[-1] + 1] + pd.Timedelta(days=30)
+    np.testing.assert_allclose(win.T0, (dates[win.ends] - dates[win.starts]).days / 365, rtol=1e-12)
+    S, r = history["spy"].to_numpy(), history["r"].to_numpy()
+    np.testing.assert_allclose(win.K, S[win.starts] * np.exp(r[win.starts] * win.T0), rtol=1e-15)
+    np.testing.assert_array_equal(win.sigma_i, history["sigma_i"].to_numpy()[win.starts])
+
+
+def test_study_windows_on_calendar(calendar_history):
+    win = study_windows(calendar_history, first_start="2021-10-02")  # a Saturday
+    dates = calendar_history.index
+    assert dates[win.starts[0]] == pd.Timestamp("2021-10-04")
+    _check_window_rules(calendar_history, win, "2021-10-02")
+    np.testing.assert_allclose(win.t, (dates - dates[0]).days / 365, rtol=0, atol=1e-15)
+    # 2021-10-26 plus 30 days is Thanksgiving, a holiday here, so t_end is the day before.
+    w = np.flatnonzero(dates[win.starts] == pd.Timestamp("2021-10-26"))[0]
+    assert dates[win.ends[w]] == pd.Timestamp("2021-11-24")
+
+
+def test_study_windows_on_frozen_history():
+    history = load_history()
+    win = study_windows(history)
+    assert history.index[win.starts[0]] == pd.Timestamp("2021-10-01")
+    _check_window_rules(history, win, "2021-10-01")
+    steps = win.ends - win.starts
+    print(f"{win.starts.size} windows, {steps.min()} to {steps.max()} steps")
+    assert steps.min() >= 17 and steps.max() <= 22
+
+
+def test_windows_containing(calendar_history):
+    dates = calendar_history.index
+    starts = np.array([0, 5, 10, 20])
+    ends = starts + 4
+    np.testing.assert_array_equal(
+        windows_containing(dates, starts, ends, dates[8], dates[11]), [False, True, True, False]
+    )
+    # A window ending on the first day, or starting on the last, is flagged.
+    np.testing.assert_array_equal(
+        windows_containing(dates, [4, 11], [8, 15], dates[8], dates[11]), [True, True]
+    )
+    # A range holding no trading day (a weekend) flags nothing.
+    assert not windows_containing(dates, starts, ends, "2021-10-02", "2021-10-03").any()
+
+
+def test_non_overlapping(calendar_history):
+    win = study_windows(calendar_history)
+    for first in range(3):
+        sub = non_overlapping(win.starts, win.ends, first)
+        assert sub[0] == first and sub.size >= 2
+        assert (win.starts[sub[1:]] >= win.ends[sub[:-1]]).all()  # no shared daily return
+        assert (win.starts[sub[1:] - 1] < win.ends[sub[:-1]]).all()  # each is the first that fits
+        assert win.starts[-1] < win.ends[sub[-1]]  # nothing fits after the last
+    with pytest.raises(ValueError):
+        non_overlapping(win.starts[::-1], win.ends[::-1])
+    with pytest.raises(ValueError):
+        non_overlapping(win.starts, win.ends, first=win.starts.size)
+
+
+# ---------------------------------------------------------------------------
+# R² ladder, bootstrap and hedging error
+# ---------------------------------------------------------------------------
+
+def test_r2_45_along_last_axis():
+    y = np.array([[1.0, 2.0, 3.0], [1.0, 2.0, 3.0]])
+    p = np.array([[1.0, 2.0, 4.0], [2.0, 2.0, 2.0]])
+    np.testing.assert_allclose(r2_45(y, p), [0.5, 0.0], rtol=0, atol=1e-15)
+
+
+def test_ols_line():
+    p = np.linspace(-1.0, 2.0, 7)
+    alpha, beta = ols_line(0.3 + 1.7 * p, p)
+    assert alpha == pytest.approx(0.3, abs=1e-14) and beta == pytest.approx(1.7, rel=1e-14)
+    y = 0.5 * p + np.random.default_rng(11).standard_normal(7)
+    np.testing.assert_allclose(ols_line(y, p), np.polyfit(p, y, 1)[::-1], rtol=1e-12)
+    _, betas = ols_line(np.stack([y, 0.3 + 1.7 * p]), np.stack([p, p]))  # rows are samples
+    np.testing.assert_allclose(betas, [ols_line(y, p)[1], 1.7], rtol=1e-12)
+
+
+def test_block_bootstrap_indices():
+    idx = block_bootstrap_indices(100, 42, 500, seed=12)
+    assert idx.shape == (500, 100)
+    np.testing.assert_array_equal(idx, block_bootstrap_indices(100, 42, 500, seed=12))
+    # Each row joins ceil(100/42) = 3 runs of consecutive indices, cut at 42 and 84.
+    for start in (0, 42, 84):
+        np.testing.assert_array_equal(np.diff(idx[:, start : start + 42], axis=1), 1)
+    # Block starts are drawn from every position 0, ..., 100 - 42 and no other.
+    firsts = idx[:, [0, 42, 84]]
+    assert firsts.min() == 0 and firsts.max() == 58
+    assert idx.min() >= 0 and idx.max() <= 99
+    with pytest.raises(ValueError):
+        block_bootstrap_indices(10, 11, 5, seed=0)
+
+
+def test_r2_ladder():
+    rng = np.random.default_rng(13)
+    p = rng.standard_normal(200)
+    y = p + 0.5 * rng.standard_normal(200)
+    boot = block_bootstrap_indices(200, 10, 300, seed=14)
+    table = r2_ladder(y, {"perfect": y, "noisy": p}, boot)
+    assert list(table.index) == ["perfect", "noisy"]
+    perfect, noisy = table.loc["perfect"], table.loc["noisy"]
+    assert perfect["r2_45"] == 1.0 and perfect["r2_lo"] == 1.0 and perfect["r2_hi"] == 1.0
+    assert perfect["alpha"] == pytest.approx(0.0, abs=1e-15)
+    for name in ("beta", "beta_lo", "beta_hi"):
+        assert perfect[name] == pytest.approx(1.0, rel=1e-14)
+    assert noisy["n"] == 200
+    assert noisy["r2_45"] == pytest.approx(r2_45(y, p), rel=1e-14)
+    assert (noisy["alpha"], noisy["beta"]) == pytest.approx(ols_line(y, p), rel=1e-14)
+    assert noisy["r2_lo"] < noisy["r2_45"] < noisy["r2_hi"]
+    assert noisy["beta_lo"] < noisy["beta"] < noisy["beta_hi"]
+    assert r2_ladder(y, {"noisy": p})[["r2_lo", "r2_hi", "beta_lo", "beta_hi"]].isna().all(axis=None)
+
+
+def test_hedging_error_stats():
+    pnl = np.array([[0.1, -0.2], [0.3, 0.05]])
+    p_gap = np.array([[0.0, -0.1], [0.1, 0.1]])
+    e = (pnl - p_gap).ravel()
+    stats = hedging_error_stats(pnl, p_gap)
+    assert stats["mean"] == pytest.approx(0.0375, abs=1e-15)
+    assert stats["std"] == pytest.approx(e.std(ddof=0), rel=1e-14)
+    assert stats["rmse"] ** 2 == pytest.approx(np.mean(e**2), rel=1e-14)
+
+
+# ---------------------------------------------------------------------------
+# Weekday diagnostic
+# ---------------------------------------------------------------------------
+
+def test_weekday_diagnostic(calendar_history):
+    dates = calendar_history.index
+    win = study_windows(calendar_history)
+    S, r = calendar_history["spy"].to_numpy(), calendar_history["r"].to_numpy()
+    res = simulate_windows(S, win.t, r, win.starts, win.ends, win.sigma_i, win.K, h=1, c=0.0)
+
+    # Constructed residuals: 1 on intervals closing on a Monday, 0 on the rest.
+    valid = ~np.isnan(res.interval_pnl)
+    end_close = win.ends[:, None] - np.arange(valid.shape[1])[::-1]
+    monday = valid & (dates.weekday.to_numpy()[np.where(valid, end_close, 0)] == 0)
+    pnl = np.where(valid, res.interval_p_step + monday, np.nan)
+    same = np.tile(np.arange(win.starts.size), (4, 1))  # resamples equal to the sample
+    table, eta2 = weekday_diagnostic(pnl, res.interval_p_step, dates, win.starts, win.ends, 1, same)
+
+    assert list(table.index) == ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "All"]
+    n_all = valid.sum()
+    assert table.loc["All", "intervals"] == n_all == table["intervals"].iloc[:5].sum()
+    np.testing.assert_allclose(table["residual"], [1, 0, 0, 0, 0, monday.sum() / n_all], atol=1e-12)
+    np.testing.assert_allclose(table["share"], [1, 0, 0, 0, 0, 1], atol=1e-12)
+    np.testing.assert_allclose(table["residual_lo"], table["residual"], atol=1e-12)
+    np.testing.assert_allclose(table["residual_hi"], table["residual"], atol=1e-12)
+    assert eta2 == pytest.approx(1.0, abs=1e-12)
+    assert table.loc["All", "pnl"] == pytest.approx(np.nanmean(pnl), rel=1e-12)
+    assert table.loc["All", "p_step"] == pytest.approx(np.nanmean(res.interval_p_step), rel=1e-12)
+    # Daily intervals span one calendar day, three over a weekend, more over a holiday.
+    assert table.loc["Tuesday", "calendar_days"] == 1.0 and table.loc["Wednesday", "calendar_days"] == 1.0
+    assert table.loc["Monday", "calendar_days"] > 3.0  # 2021-12-27 follows the 12-24 holiday
+
+    # With a stub (h = 2), interval lengths still add up to each window's calendar days.
+    res2 = simulate_windows(S, win.t, r, win.starts, win.ends, win.sigma_i, win.K, h=2, c=0.0)
+    table2, _ = weekday_diagnostic(
+        res2.interval_pnl, res2.interval_p_step, dates, win.starts, win.ends, 2
+    )
+    total_days = np.sum((dates[win.ends] - dates[win.starts]).days)
+    assert table2.loc["All", "calendar_days"] == pytest.approx(total_days / res2.n_intervals.sum(), rel=1e-12)
+    assert table2["residual_lo"].isna().all()

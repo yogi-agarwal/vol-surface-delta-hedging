@@ -22,12 +22,19 @@ dividends.
 
 Shapes: one window has S and t of shape (n + 1,) and r of shape (n,); P
 windows of the same length stack along a leading axis as (P, n + 1) and
-(P, n). Windows of different lengths go through simulate_windows.
+(P, n). Windows of different lengths go through simulate_windows, and GBM
+paths on the calendars of real windows through simulate_gbm_windows.
+
+The real-data study adds the rolling windows (study_windows), the April 2025
+exclusion (windows_containing), non-overlapping subsamples, the R² ladder with
+moving block bootstrap intervals, hedging error statistics and the weekday
+diagnostic of P_step residuals.
 """
 
 from typing import NamedTuple
 
 import numpy as np
+import pandas as pd
 
 from volsurf.black_scholes import bs_delta, bs_gamma, bs_price, bs_vega
 
@@ -113,15 +120,18 @@ def gbm_paths(S0, mu, sigma, t, n_paths, seed):
     ----------
     S0 : float
         Initial price.
-    mu : float
-        Drift per year as a decimal (arithmetic, so E[S_t] = S0·exp(mu·t)).
+    mu : float or array_like of shape (n,) or (n_paths, n)
+        Drift per year as a decimal (arithmetic, so E[S_t] = S0·exp(mu·t)
+        for a constant mu); an array gives each step, and optionally each
+        path, its own drift.
     sigma : float or array_like of shape (n_paths,)
         Volatility per year as a decimal; an array gives each path its own.
-    t : array_like of shape (n + 1,)
-        Increasing times in years; t[0] is the time of S0.
+    t : array_like of shape (n + 1,) or (n_paths, n + 1)
+        Increasing times in years; t[..., 0] is the time of S0. A 2-D grid
+        gives each path its own calendar.
     n_paths : int
         Number of paths.
-    seed : int
+    seed : int or sequence of int
         Seed for np.random.default_rng.
 
     Returns
@@ -131,9 +141,10 @@ def gbm_paths(S0, mu, sigma, t, n_paths, seed):
     """
     rng = np.random.default_rng(seed)
     t = np.asarray(t, dtype=float)
-    dt = np.diff(t)
+    dt = np.diff(t, axis=-1)
+    mu = np.asarray(mu, dtype=float)
     sigma = np.asarray(sigma, dtype=float)[..., None]
-    z = rng.standard_normal((n_paths, dt.size))
+    z = rng.standard_normal((n_paths, dt.shape[-1]))
     log_steps = (mu - 0.5 * sigma**2) * dt + sigma * np.sqrt(dt) * z
     log_path = np.concatenate([np.zeros((n_paths, 1)), np.cumsum(log_steps, axis=-1)], axis=-1)
     return S0 * np.exp(log_path)
@@ -169,16 +180,17 @@ def hedge_grid(n_steps, h):
 
 
 def r2_45(y, p):
-    """R² of predictions about the 45 degree line.
+    """R² of predictions about the 45 degree line, along the last axis.
 
     Parameters
     ----------
-    y, p : array_like of the same shape
-        Outcomes and predictions (same units).
+    y, p : array_like of the same shape (..., n)
+        Outcomes and predictions (same units); leading axes index separate
+        samples, for example bootstrap resamples.
 
     Returns
     -------
-    float
+    float or ndarray of shape (...)
         1 - sum (y - p)² / sum (y - mean(y))². Equals 1 for perfect
         predictions and 0 when p is the sample mean; negative when p does
         worse than the mean. Unlike the OLS R², it penalises any intercept
@@ -186,7 +198,31 @@ def r2_45(y, p):
     """
     y = np.asarray(y, dtype=float)
     p = np.asarray(p, dtype=float)
-    return 1.0 - np.sum((y - p) ** 2) / np.sum((y - y.mean()) ** 2)
+    spread = y - y.mean(axis=-1, keepdims=True)
+    return 1.0 - np.sum((y - p) ** 2, axis=-1) / np.sum(spread**2, axis=-1)
+
+
+def ols_line(y, p):
+    """Ordinary least squares fit y = alpha + beta·p, along the last axis.
+
+    Parameters
+    ----------
+    y, p : array_like of the same shape (..., n)
+        Outcomes and predictions (same units).
+
+    Returns
+    -------
+    alpha, beta : float or ndarray of shape (...)
+        Intercept (units of y) and slope. Theory for a perfect predictor
+        gives alpha = 0 and beta = 1.
+    """
+    y = np.asarray(y, dtype=float)
+    p = np.asarray(p, dtype=float)
+    y_bar = y.mean(axis=-1, keepdims=True)
+    p_bar = p.mean(axis=-1, keepdims=True)
+    beta = np.sum((p - p_bar) * (y - y_bar), axis=-1) / np.sum((p - p_bar) ** 2, axis=-1)
+    alpha = y_bar[..., 0] - beta * p_bar[..., 0]
+    return alpha, beta
 
 
 def _check_shape(x, name, allowed):
@@ -400,24 +436,10 @@ def simulate_windows(S, t, r, starts, ends, sigma_i, K, h, c, q=0.0, is_call=Tru
         If the history, the bounds or a per-window input has the wrong shape
         or type, or a window is empty or out of range.
     """
-    S, t, r = (np.asarray(x, dtype=float) for x in (S, t, r))
-    if S.ndim != 1 or t.shape != S.shape or r.shape != S.shape:
-        raise ValueError("S, t and r must be 1-D histories of the same length")
-    starts, ends = np.asarray(starts), np.asarray(ends)
-    if starts.ndim != 1 or ends.shape != starts.shape:
-        raise ValueError("starts and ends must be 1-D arrays of the same length")
-    if not (np.issubdtype(starts.dtype, np.integer) and np.issubdtype(ends.dtype, np.integer)):
-        raise ValueError("starts and ends must be integer indices")
-    if np.any(starts < 0) or np.any(ends <= starts) or np.any(ends >= S.size):
-        raise ValueError("every window needs 0 <= start < end < len(S)")
-
+    S, t, r = _histories(S, t, r)
+    starts, ends = _window_bounds(starts, ends, S.size)
     n_windows = starts.size
-    per_window = []
-    for x, name in ((sigma_i, "sigma_i"), (K, "K"), (q, "q")):
-        x = np.asarray(x, dtype=float)
-        _check_shape(x, name, [(), (n_windows,)])
-        per_window.append(np.broadcast_to(x, (n_windows,)))
-    sigma_i, K, q = per_window
+    sigma_i, K, q = (_per_window(x, name, n_windows) for x, name in ((sigma_i, "sigma_i"), (K, "K"), (q, "q")))
 
     lengths = ends - starts
     parts = []
@@ -429,6 +451,33 @@ def simulate_windows(S, t, r, starts, ends, sigma_i, K, h, c, q=0.0, is_call=Tru
         )
         parts.append((rows, res))
     return _assemble(parts, n_windows)
+
+
+def _histories(*arrays):
+    """Cast histories to float arrays; raise unless all are 1-D of one length."""
+    arrays = [np.asarray(x, dtype=float) for x in arrays]
+    if arrays[0].ndim != 1 or any(x.shape != arrays[0].shape for x in arrays):
+        raise ValueError("histories must be 1-D arrays of the same length")
+    return arrays
+
+
+def _window_bounds(starts, ends, size):
+    """Check window bounds into a history of length size and return them as arrays."""
+    starts, ends = np.asarray(starts), np.asarray(ends)
+    if starts.ndim != 1 or ends.shape != starts.shape:
+        raise ValueError("starts and ends must be 1-D arrays of the same length")
+    if not (np.issubdtype(starts.dtype, np.integer) and np.issubdtype(ends.dtype, np.integer)):
+        raise ValueError("starts and ends must be integer indices")
+    if np.any(starts < 0) or np.any(ends <= starts) or np.any(ends >= size):
+        raise ValueError("every window needs 0 <= start < end < len(S)")
+    return starts, ends
+
+
+def _per_window(x, name, n_windows):
+    """Broadcast a scalar or (W,) per-window input to shape (W,); raise otherwise."""
+    x = np.asarray(x, dtype=float)
+    _check_shape(x, name, [(), (n_windows,)])
+    return np.broadcast_to(x, (n_windows,))
 
 
 def _assemble(parts, n_windows, extra=()):
@@ -464,3 +513,443 @@ def _assemble(parts, n_windows, extra=()):
             out[name][rows, ..., n_max - res.n_intervals :] = getattr(res, name)
         n_intervals[rows] = res.n_intervals
     return HedgeResult(**out, n_intervals=n_intervals)
+
+
+def simulate_gbm_windows(t, r, starts, ends, sigma_true, sigma_i, h, c, n_paths, seed):
+    """Delta-hedge GBM paths on the calendars and rates of real windows.
+
+    Window w gets n_paths paths that start at 100 on the closes
+    t[starts[w]], ..., t[ends[w]], with volatility sigma_true[w] and, at each
+    step, drift equal to the step rate (the risk-neutral drift of a
+    total-return series). Each path is hedged as the real window is: implied
+    vol sigma_i[w], financing at the same step rates, strike
+    F0 = 100·exp(r0·T0) and q = 0. P&L fractions do not depend on the price
+    level, so starting every path at 100 loses nothing. Windows of n steps
+    draw their normals from np.random.default_rng([seed, n]), so one seed
+    gives the same normals whatever sigma_true, h or c.
+
+    Parameters
+    ----------
+    t, r : array_like of shape (M,)
+        Times of the history's closes in years (ACT/365) and the
+        continuously compounded rate at each close.
+    starts, ends : array_like of int, shape (W,)
+        Window bounds, as in simulate_windows.
+    sigma_true, sigma_i : float or array_like of shape (W,)
+        Volatility of the simulated paths and implied vol used to price and
+        hedge, as decimals.
+    h, c
+        As in simulate_window.
+    n_paths : int
+        Paths per window.
+    seed : int
+        Base seed.
+
+    Returns
+    -------
+    HedgeResult
+        Per-path fields of shape (W, n_paths), interval fields of shape
+        (W, n_paths, N_max) aligned at expiry as in simulate_windows, and
+        n_intervals of shape (W,).
+    """
+    t, r = _histories(t, r)
+    starts, ends = _window_bounds(starts, ends, t.size)
+    n_windows = starts.size
+    sigma_true = _per_window(sigma_true, "sigma_true", n_windows)
+    sigma_i = _per_window(sigma_i, "sigma_i", n_windows)
+
+    lengths = ends - starts
+    parts = []
+    for n in np.unique(lengths):
+        rows = np.flatnonzero(lengths == n)
+        closes = starts[rows, None] + np.arange(n + 1)
+        # Window-major rows: the n_paths paths of one window are adjacent.
+        times = np.repeat(t[closes], n_paths, axis=0)
+        rates = np.repeat(r[closes[:, :-1]], n_paths, axis=0)
+        vols = np.repeat(sigma_true[rows], n_paths)
+        paths = gbm_paths(100.0, rates, vols, times, times.shape[0], seed=[seed, int(n)])
+        strike = 100.0 * np.exp(rates[:, 0] * (times[:, -1] - times[:, 0]))
+        res = simulate_window(paths, times, rates, np.repeat(sigma_i[rows], n_paths), strike, h, c)
+        by_window = {
+            name: getattr(res, name).reshape((rows.size, n_paths) + getattr(res, name).shape[1:])
+            for name in _FIELDS + _INTERVAL_FIELDS
+        }
+        parts.append((rows, res._replace(**by_window)))
+    return _assemble(parts, n_windows, extra=(n_paths,))
+
+
+def synthetic_window_set(n_windows, seed_vols, seed_paths):
+    """The synthetic GBM window set of DESIGN.md section 3.
+
+    sigma_i ~ lognormal(ln 0.17, 0.35), then sigma_true = sigma_i·exp(N(-0.2, 0.3)),
+    both from np.random.default_rng(seed_vols). Paths start at 100 and run
+    21 daily steps of 1/252 years with zero drift and volatility sigma_true
+    (gbm_paths with seed_paths). Hedge them with r = q = 0 and K = F0 = 100.
+
+    Parameters
+    ----------
+    n_windows : int
+        Number of windows.
+    seed_vols, seed_paths : int
+        Seeds for the volatility draws and for the paths.
+
+    Returns
+    -------
+    S : ndarray of shape (n_windows, 22)
+        Prices.
+    t : ndarray of shape (22,)
+        Times in years.
+    sigma_i : ndarray of shape (n_windows,)
+        Implied vols as decimals.
+    """
+    rng = np.random.default_rng(seed_vols)
+    sigma_i = np.exp(rng.normal(np.log(0.17), 0.35, n_windows))
+    sigma_true = sigma_i * np.exp(rng.normal(-0.2, 0.3, n_windows))
+    t = np.arange(22) / 252
+    return gbm_paths(100.0, 0.0, sigma_true, t, n_windows, seed=seed_paths), t, sigma_i
+
+
+# ---------------------------------------------------------------------------
+# Real-data study (DESIGN.md section 3)
+# ---------------------------------------------------------------------------
+
+
+class StudyWindows(NamedTuple):
+    """Rolling windows of the real-data study, as built by study_windows.
+
+    Attributes
+    ----------
+    t : ndarray of shape (M,)
+        Time of every close in years since the first close (ACT/365).
+    starts, ends : ndarray of int, shape (W,)
+        History indices of each window's t0 and t_end closes.
+    T0 : ndarray of shape (W,)
+        Window length t_end - t0 in years.
+    sigma_i : ndarray of shape (W,)
+        Implied vol at t0 as a decimal (^VIX close / 100).
+    K : ndarray of shape (W,)
+        Strike F0 = S0·exp(r0·T0).
+    """
+
+    t: np.ndarray
+    starts: np.ndarray
+    ends: np.ndarray
+    T0: np.ndarray
+    sigma_i: np.ndarray
+    K: np.ndarray
+
+
+def study_windows(history, first_start="2021-10-01", horizon_days=30):
+    """Rolling windows of DESIGN.md section 3, one per trading day.
+
+    Windows start on every trading day t0 from the first one on or after
+    first_start. t_end is the last trading day on or before t0 plus
+    horizon_days calendar days, and a window is kept only when t0 plus
+    horizon_days is on or before the last date of the history, so every
+    window is complete.
+
+    Parameters
+    ----------
+    history : pd.DataFrame
+        As returned by data.load_history: unique, increasing trading dates
+        as the index, and columns spy (price), sigma_i (decimal) and r
+        (continuously compounded decimal).
+    first_start : str or pd.Timestamp, default "2021-10-01"
+        Earliest start date.
+    horizon_days : int, default 30
+        Calendar days from t0 to the nominal expiry.
+
+    Returns
+    -------
+    StudyWindows
+        Times, bounds, lengths, implied vols and strikes of the windows.
+
+    Raises
+    ------
+    ValueError
+        If the dates are not unique and increasing.
+    """
+    dates = pd.DatetimeIndex(history.index)
+    if not (dates.is_unique and dates.is_monotonic_increasing):
+        raise ValueError("history dates must be unique and increasing")
+    t = np.asarray((dates - dates[0]).days, dtype=float) / 365
+    horizon = dates + pd.Timedelta(days=horizon_days)
+    starts = np.arange(dates.searchsorted(pd.Timestamp(first_start)), dates.size)
+    starts = starts[horizon[starts] <= dates[-1]]
+    ends = dates.searchsorted(horizon[starts], side="right") - 1
+    keep = ends > starts
+    starts, ends = starts[keep], ends[keep]
+
+    S = history["spy"].to_numpy(dtype=float)
+    r = history["r"].to_numpy(dtype=float)
+    T0 = t[ends] - t[starts]
+    K = S[starts] * np.exp(r[starts] * T0)
+    sigma_i = history["sigma_i"].to_numpy(dtype=float)[starts]
+    return StudyWindows(t=t, starts=starts, ends=ends, T0=T0, sigma_i=sigma_i, K=K)
+
+
+def windows_containing(dates, starts, ends, first, last):
+    """Flag windows whose closes include any trading day from first to last.
+
+    Parameters
+    ----------
+    dates : DatetimeIndex or array_like of datetime64, shape (M,)
+        Increasing dates of the history's closes.
+    starts, ends : array_like of int, shape (W,)
+        History indices of each window's first and last close.
+    first, last : str or pd.Timestamp
+        Inclusive date range.
+
+    Returns
+    -------
+    ndarray of bool, shape (W,)
+        True where some close starts[w], ..., ends[w] falls in the range.
+    """
+    dates = pd.DatetimeIndex(dates)
+    lo = dates.searchsorted(pd.Timestamp(first), side="left")
+    hi = dates.searchsorted(pd.Timestamp(last), side="right") - 1
+    starts, ends = np.asarray(starts), np.asarray(ends)
+    return (lo <= hi) & (starts <= hi) & (ends >= lo)
+
+
+def non_overlapping(starts, ends, first=0):
+    """Greedy subsample of windows that share no daily return.
+
+    Starting from window first, each next window is the first, in start
+    order, whose start close is at or after the previous window's end close.
+
+    Parameters
+    ----------
+    starts, ends : array_like of int, shape (W,)
+        History indices of each window's first and last close; starts must
+        be strictly increasing.
+    first : int, default 0
+        Index of the window the subsample starts from.
+
+    Returns
+    -------
+    ndarray of int
+        Increasing window indices, beginning with first.
+
+    Raises
+    ------
+    ValueError
+        If starts is not strictly increasing or first is out of range.
+    """
+    starts, ends = np.asarray(starts), np.asarray(ends)
+    if np.any(np.diff(starts) <= 0):
+        raise ValueError("starts must be strictly increasing")
+    if not 0 <= first < starts.size:
+        raise ValueError("first must index a window")
+    chosen = [first]
+    while (nxt := np.searchsorted(starts, ends[chosen[-1]], side="left")) < starts.size:
+        chosen.append(int(nxt))
+    return np.array(chosen)
+
+
+def block_bootstrap_indices(n, block, n_resamples, seed):
+    """Moving block bootstrap resamples of a sequence of n observations.
+
+    Each resample joins ceil(n/block) blocks of block consecutive indices,
+    whose first indices are drawn uniformly, with replacement, from
+    0, ..., n - block, and keeps the first n indices.
+
+    Parameters
+    ----------
+    n : int
+        Sequence length.
+    block : int
+        Block length, 1 <= block <= n.
+    n_resamples : int
+        Number of resamples.
+    seed : int
+        Seed for np.random.default_rng.
+
+    Returns
+    -------
+    ndarray of int, shape (n_resamples, n)
+        Indices into the sequence, one resample per row.
+    """
+    if not 1 <= block <= n:
+        raise ValueError("block length must be between 1 and n")
+    rng = np.random.default_rng(seed)
+    n_blocks = -(-n // block)
+    first = rng.integers(0, n - block + 1, size=(n_resamples, n_blocks))
+    return (first[..., None] + np.arange(block)).reshape(n_resamples, -1)[:, :n]
+
+
+_LADDER_COLUMNS = ["n", "r2_45", "r2_lo", "r2_hi", "alpha", "beta", "beta_lo", "beta_hi"]
+
+
+def r2_ladder(y, predictors, boot_idx=None, level=0.95):
+    """R² about the 45 degree line and the OLS line of each predictor, with bootstrap intervals.
+
+    Parameters
+    ----------
+    y : array_like of shape (n,)
+        Outcomes, for example hedged P&L as a fraction of C0·G0.
+    predictors : dict of str to array_like of shape (n,)
+        Predictions in the units of y, in the order of the output rows.
+    boot_idx : ndarray of int, shape (B, n), optional
+        Resampled indices (block_bootstrap_indices). Every predictor uses
+        the same resamples, and each statistic is recomputed on each.
+    level : float, default 0.95
+        Coverage of the percentile intervals.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per predictor with columns n, r2_45 (r2_45), r2_lo and r2_hi
+        (its interval), alpha and beta (ols_line; alpha in the units of y),
+        beta_lo and beta_hi. Interval columns are NaN without boot_idx.
+    """
+    y = np.asarray(y, dtype=float)
+    tails = [50.0 * (1.0 - level), 100.0 - 50.0 * (1.0 - level)]
+    rows = {}
+    for name, p in predictors.items():
+        p = np.asarray(p, dtype=float)
+        if y.ndim != 1 or p.shape != y.shape:
+            raise ValueError(f"y and {name} must be 1-D arrays of the same length")
+        alpha, beta = ols_line(y, p)
+        row = {"n": y.size, "r2_45": r2_45(y, p), "alpha": alpha, "beta": beta}
+        row.update(r2_lo=np.nan, r2_hi=np.nan, beta_lo=np.nan, beta_hi=np.nan)
+        if boot_idx is not None:
+            y_b, p_b = y[boot_idx], p[boot_idx]
+            row["r2_lo"], row["r2_hi"] = np.percentile(r2_45(y_b, p_b), tails)
+            row["beta_lo"], row["beta_hi"] = np.percentile(ols_line(y_b, p_b)[1], tails)
+        rows[name] = row
+    return pd.DataFrame.from_dict(rows, orient="index")[_LADDER_COLUMNS]
+
+
+def hedging_error_stats(pnl, p_gap):
+    """Mean, std and RMSE of the hedging error e = pnl - p_gap.
+
+    Parameters
+    ----------
+    pnl, p_gap : array_like of the same shape
+        Hedged P&L and vol-gap predictor as fractions of C0·G0, over windows
+        (and paths); every element counts once.
+
+    Returns
+    -------
+    dict
+        mean, std and rmse of e as fractions of C0·G0. std is the population
+        std (ddof 0), so rmse = √(mean² + std²) = √mean(e²).
+    """
+    e = np.ravel(np.asarray(pnl, dtype=float) - np.asarray(p_gap, dtype=float))
+    mean, std = e.mean(), e.std()
+    return {"mean": mean, "std": std, "rmse": np.sqrt(mean**2 + std**2)}
+
+
+def derman_kamal(n_intervals, vega0, sigma_i, c0):
+    """Asymptotic std of discretely delta-hedged P&L with known vol (Derman-Kamal).
+
+    Parameters
+    ----------
+    n_intervals : float or array_like
+        Number of equal hedge intervals N.
+    vega0 : float or array_like
+        Vega at t0 per unit of volatility.
+    sigma_i : float or array_like
+        Implied (and true) vol as a decimal.
+    c0 : float or array_like
+        Premium, in the currency units of vega0.
+
+    Returns
+    -------
+    float or ndarray
+        √(π/4)·vega0·sigma_i/(√N·c0), as a fraction of the premium.
+    """
+    return np.sqrt(np.pi / 4) * vega0 * sigma_i / (np.sqrt(n_intervals) * c0)
+
+
+_WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+_WEEKDAY_COLUMNS = [
+    "intervals", "calendar_days", "pnl", "p_step", "residual", "residual_lo", "residual_hi", "share",
+]
+
+
+def weekday_diagnostic(interval_pnl, interval_p_step, dates, starts, ends, h, boot_idx=None, level=0.95):
+    """P_step residuals grouped by the weekday of each hedge interval's closing day.
+
+    The residual of an interval is its hedged P&L minus its P_step term.
+    Grouping by the closing weekday separates Friday-to-Monday intervals,
+    which charge three calendar days of sigma_i² against about one trading
+    day of realised variance.
+
+    Parameters
+    ----------
+    interval_pnl, interval_p_step : array_like of shape (W, N)
+        As returned by simulate_windows: aligned at expiry, NaN before a
+        window's first interval, fractions of C0·G0.
+    dates : DatetimeIndex or array_like of datetime64, shape (M,)
+        Dates of the history's closes.
+    starts, ends : array_like of int, shape (W,)
+        Window bounds passed to simulate_windows.
+    h : int
+        Rebalance interval passed to simulate_windows.
+    boot_idx : ndarray of int, shape (B, W), optional
+        Window resamples (block_bootstrap_indices); the mean residuals are
+        recomputed on each resample for percentile intervals.
+    level : float, default 0.95
+        Coverage of the intervals.
+
+    Returns
+    -------
+    table : pd.DataFrame
+        One row per weekday, Monday to Friday, and a final row All. Columns:
+        intervals (count), calendar_days (mean interval length in calendar
+        days), pnl, p_step and residual (means per interval, fractions of
+        C0·G0), residual_lo and residual_hi (interval for the mean residual,
+        NaN without boot_idx) and share (the weekday's sum of residuals over
+        the sum of all residuals).
+    eta2 : float
+        Share of the residuals' variance explained by the weekday means,
+        sum_d n_d·(mean_d - mean)² / sum (residual - mean)².
+    """
+    pnl = np.asarray(interval_pnl, dtype=float)
+    step = np.asarray(interval_p_step, dtype=float)
+    dates = pd.DatetimeIndex(dates)
+    starts, ends = np.asarray(starts), np.asarray(ends)
+    valid = ~np.isnan(pnl)
+
+    # Closes bounding each interval; padded cells point at t_end and are masked out.
+    end_close = ends[:, None] - h * np.arange(pnl.shape[1])[::-1]
+    start_close = np.maximum(end_close - h, starts[:, None])
+    end_close = np.where(valid, end_close, ends[:, None])
+    start_close = np.where(valid, start_close, ends[:, None])
+    day = dates.to_numpy()
+    days = (day[end_close] - day[start_close]) / np.timedelta64(1, "D")
+    weekday = np.where(valid, dates.weekday.to_numpy()[end_close], -1)
+    member = weekday[..., None] == np.arange(len(_WEEKDAYS))  # (W, N, 5); False on padding
+
+    def by_weekday(x):
+        """Per-window sums of x over the intervals closing on each weekday, shape (W, 5)."""
+        return np.sum(np.where(member, x[..., None], 0.0), axis=1)
+
+    resid = pnl - step
+    counts, resid_w = member.sum(axis=1), by_weekday(resid)
+    n_d = counts.sum(axis=0)
+    table = pd.DataFrame(index=_WEEKDAYS + ["All"], columns=_WEEKDAY_COLUMNS, dtype=float)
+    table["intervals"] = np.append(n_d, valid.sum())
+    with np.errstate(invalid="ignore", divide="ignore"):  # a weekday without intervals gives NaN
+        for name, x in (("calendar_days", days), ("pnl", pnl), ("p_step", step), ("residual", resid)):
+            table[name] = np.append(by_weekday(x).sum(axis=0) / n_d, x[valid].mean())
+    table["share"] = np.append(resid_w.sum(axis=0), resid[valid].sum()) / resid[valid].sum()
+
+    if boot_idx is not None:
+        # Weight each window by how often a resample draws it; the weekday means are ratios of
+        # weighted sums, so no (B, W, N) array is needed.
+        n_resamples, n_windows = boot_idx.shape
+        cells = (np.arange(n_resamples)[:, None] * n_windows + boot_idx).ravel()
+        weights = np.bincount(cells, minlength=n_resamples * n_windows).reshape(n_resamples, n_windows)
+        sums = np.column_stack([resid_w, resid_w.sum(axis=1)])
+        with np.errstate(invalid="ignore", divide="ignore"):
+            boot = (weights @ sums) / (weights @ np.column_stack([counts, counts.sum(axis=1)]))
+        tails = [50.0 * (1.0 - level), 100.0 - 50.0 * (1.0 - level)]
+        table["residual_lo"], table["residual_hi"] = np.percentile(boot, tails, axis=0)
+
+    grand_mean = resid[valid].mean()
+    between = np.sum(n_d[n_d > 0] * (table["residual"].to_numpy()[:-1][n_d > 0] - grand_mean) ** 2)
+    eta2 = between / np.sum((resid[valid] - grand_mean) ** 2)
+    return table, eta2
