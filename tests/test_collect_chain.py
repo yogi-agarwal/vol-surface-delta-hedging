@@ -1,0 +1,123 @@
+"""Tests for scripts/collect_chain.py: time guard and NTM zero-bid abort logic."""
+
+import importlib.util
+import pathlib
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import numpy as np
+import pandas as pd
+import pytest
+
+# ---------------------------------------------------------------------------
+# Import the script module without executing main()
+# ---------------------------------------------------------------------------
+_SCRIPT = pathlib.Path(__file__).parents[1] / "scripts" / "collect_chain.py"
+_spec = importlib.util.spec_from_file_location("collect_chain", _SCRIPT)
+_cc = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_cc)
+
+is_market_hours = _cc.is_market_hours
+_ntm_zero_bid_share = _cc._ntm_zero_bid_share
+BAND = _cc.BAND
+
+NY = ZoneInfo("America/New_York")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _ny(year: int, month: int, day: int, hour: int, minute: int, second: int = 0) -> datetime:
+    return datetime(year, month, day, hour, minute, second, tzinfo=NY)
+
+
+# Monday 2026-09-28 is a weekday (verified via calendar).
+MON = (2026, 9, 28)
+SAT = (2026, 9, 26)
+SUN = (2026, 9, 27)
+
+
+# ---------------------------------------------------------------------------
+# Time guard tests
+# ---------------------------------------------------------------------------
+
+def test_weekday_in_window():
+    assert is_market_hours(_ny(*MON, 10, 0)) is True
+
+
+def test_weekday_open_boundary():
+    assert is_market_hours(_ny(*MON, 9, 30, 0)) is True
+
+
+def test_weekday_before_open():
+    assert is_market_hours(_ny(*MON, 9, 29, 59)) is False
+
+
+def test_weekday_at_close():
+    # 16:00:00 is exclusive
+    assert is_market_hours(_ny(*MON, 16, 0, 0)) is False
+
+
+def test_weekday_after_close():
+    assert is_market_hours(_ny(*MON, 17, 0)) is False
+
+
+def test_saturday():
+    assert is_market_hours(_ny(*SAT, 11, 0)) is False
+
+
+def test_sunday():
+    assert is_market_hours(_ny(*SUN, 11, 0)) is False
+
+
+# ---------------------------------------------------------------------------
+# NTM zero-bid share tests
+# ---------------------------------------------------------------------------
+
+def _make_df(strikes: list[float], bids: list[float], spot: float) -> pd.DataFrame:
+    return pd.DataFrame({"strike": strikes, "bid": bids})
+
+
+def test_ntm_all_bid_nonzero():
+    spot = 500.0
+    strikes = [spot * np.exp(k) for k in (-0.04, -0.02, 0.0, 0.02, 0.04)]
+    df = _make_df(strikes, [1.0] * 5, spot)
+    assert _ntm_zero_bid_share(df, spot) == pytest.approx(0.0)
+
+
+def test_ntm_all_bid_zero():
+    spot = 500.0
+    strikes = [spot * np.exp(k) for k in (-0.04, -0.02, 0.0, 0.02, 0.04)]
+    df = _make_df(strikes, [0.0] * 5, spot)
+    assert _ntm_zero_bid_share(df, spot) == pytest.approx(1.0)
+
+
+def test_ntm_half_zero():
+    spot = 500.0
+    # 4 NTM strikes: 2 zero-bid, 2 non-zero
+    strikes = [spot * np.exp(k) for k in (-0.04, -0.02, 0.02, 0.04)]
+    bids = [0.0, 0.0, 1.5, 2.0]
+    df = _make_df(strikes, bids, spot)
+    assert _ntm_zero_bid_share(df, spot) == pytest.approx(0.5)
+
+
+def test_far_otm_excluded():
+    spot = 500.0
+    # 2 NTM rows: both zero-bid  →  share should be 1.0, not diluted by far OTM
+    ntm_strikes = [spot * np.exp(k) for k in (-0.03, 0.03)]
+    far_strikes = [spot * np.exp(k) for k in (-0.3, -0.2, -0.15, -0.1, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4)]
+    strikes = ntm_strikes + far_strikes
+    bids = [0.0, 0.0] + [0.0] * 10  # everything zero
+    df = _make_df(strikes, bids, spot)
+    # share uses only NTM rows (2 out of 12)
+    share = _ntm_zero_bid_share(df, spot)
+    assert share == pytest.approx(1.0)
+
+
+def test_empty_ntm_returns_zero():
+    spot = 500.0
+    # All strikes are far OTM → no NTM rows → share = 0.0
+    strikes = [spot * np.exp(k) for k in (-0.3, 0.3)]
+    df = _make_df(strikes, [0.0, 0.0], spot)
+    assert _ntm_zero_bid_share(df, spot) == pytest.approx(0.0)
