@@ -140,13 +140,15 @@ def test_theta_finite_difference(r, q, is_call):
 # ---------------------------------------------------------------------------
 
 def test_gamma_vega_identity():
-    # Deep ITM/OTM corners underflow vega to 0 or subnormals, where a relative
-    # check says nothing; keep points with vega > 1e-12 and require most remain.
+    # Every point of the wide grid except the deep ITM/OTM corners where vega
+    # underflows to exactly 0, where a relative check says nothing.
     K, T, sigma, r, q = _wide_grid()
     vega = bs_vega(S0, K, T, r, q, sigma)
     lhs = bs_gamma(S0, K, T, r, q, sigma) * S0**2 * sigma * T
-    keep = vega > 1e-12
-    assert keep.sum() >= 1000
+    keep = vega != 0
+    print(f"identity points kept: {keep.sum()} of {vega.size}")
+    assert vega.size == 1260
+    assert keep.sum() >= 1200
     np.testing.assert_allclose(lhs[keep], vega[keep], rtol=1e-10, atol=0)
 
 

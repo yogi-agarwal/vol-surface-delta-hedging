@@ -118,7 +118,7 @@ def main() -> None:
     if share > ABORT_THRESHOLD:
         print(
             f"NTM zero-bid share {share:.2%} exceeds threshold {ABORT_THRESHOLD:.0%}. "
-            "Quotes look empty — aborting without saving.",
+            "Quotes look empty: aborting without saving.",
             file=sys.stderr,
         )
         sys.exit(1)
