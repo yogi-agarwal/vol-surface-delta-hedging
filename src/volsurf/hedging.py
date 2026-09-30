@@ -27,7 +27,8 @@ paths on the calendars of real windows through simulate_gbm_windows.
 
 The real-data study adds the rolling windows (study_windows), the April 2025
 exclusion (windows_containing), non-overlapping subsamples at a fixed stride
-(stride_subsamples), the R² ladder with moving block bootstrap intervals,
+(stride_subsamples) and their ladder summary (stride_ladder), the R² ladder
+with moving block bootstrap intervals, multi-regressor OLS (ols_fit),
 hedging error statistics and the weekday diagnostic of P_step residuals.
 """
 
@@ -223,6 +224,33 @@ def ols_line(y, p):
     beta = np.sum((p - p_bar) * (y - y_bar), axis=-1) / np.sum((p - p_bar) ** 2, axis=-1)
     alpha = y_bar[..., 0] - beta * p_bar[..., 0]
     return alpha, beta
+
+
+def ols_fit(y, X):
+    """Ordinary least squares of y on the columns of X, along any leading axes.
+
+    Parameters
+    ----------
+    y : array_like of shape (..., n)
+        Outcomes; leading axes index separate samples, for example
+        bootstrap resamples.
+    X : array_like of shape (..., n, k)
+        Regressors, one column each; include a column of ones for an
+        intercept. Leading axes broadcast against those of y.
+
+    Returns
+    -------
+    coef : ndarray of shape (..., k)
+        Coefficients solving the normal equations X'X·coef = X'y.
+    r2 : float or ndarray of shape (...)
+        R² of y about the fitted values X·coef (r2_45), which is the OLS R²
+        when X holds a constant column.
+    """
+    y = np.asarray(y, dtype=float)
+    X = np.asarray(X, dtype=float)
+    Xt = np.swapaxes(X, -1, -2)
+    coef = np.linalg.solve(Xt @ X, Xt @ y[..., None])[..., 0]
+    return coef, r2_45(y, (X @ coef[..., None])[..., 0])
 
 
 def _check_shape(x, name, allowed):
@@ -819,6 +847,48 @@ def r2_ladder(y, predictors, boot_idx=None, level=0.95):
             row["beta_lo"], row["beta_hi"] = np.percentile(ols_line(y_b, p_b)[1], tails)
         rows[name] = row
     return pd.DataFrame.from_dict(rows, orient="index")[_LADDER_COLUMNS]
+
+
+_STRIDE_STATS = ("r2_45", "beta")
+
+
+def stride_ladder(y, predictors, subsamples):
+    """The R² ladder on each stride subsample, summarised across subsamples.
+
+    Parameters
+    ----------
+    y : array_like of shape (W,)
+        Outcomes over all windows, for example hedged P&L as a fraction of
+        C0·G0.
+    predictors : dict of str to array_like of shape (W,)
+        Predictions in the units of y, in the order of the output rows.
+    subsamples : list of ndarray of int
+        Window indices of each subsample, offset 0 first (stride_subsamples).
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per predictor. n_offset0 is the number of windows in
+        subsample 0; for each statistic s in r2_45 and beta (the r2_ladder
+        columns), s_offset0 is its value on subsample 0 and s_median, s_min
+        and s_max summarise it across all subsamples. No bootstrap.
+    """
+    y = np.asarray(y, dtype=float)
+    predictors = {name: np.asarray(p, dtype=float) for name, p in predictors.items()}
+    per_offset = [r2_ladder(y[sub], {name: p[sub] for name, p in predictors.items()}) for sub in subsamples]
+    rows = {}
+    for name in predictors:
+        x = pd.DataFrame([ladder.loc[name] for ladder in per_offset]).reset_index(drop=True)
+        row = {"n_offset0": int(x.loc[0, "n"])}
+        for stat in _STRIDE_STATS:
+            row.update({
+                f"{stat}_offset0": x.loc[0, stat],
+                f"{stat}_median": x[stat].median(),
+                f"{stat}_min": x[stat].min(),
+                f"{stat}_max": x[stat].max(),
+            })
+        rows[name] = row
+    return pd.DataFrame.from_dict(rows, orient="index")
 
 
 def hedging_error_stats(pnl, p_gap):

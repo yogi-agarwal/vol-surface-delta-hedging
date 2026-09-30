@@ -15,12 +15,14 @@ from volsurf.hedging import (
     gbm_paths,
     hedge_grid,
     hedging_error_stats,
+    ols_fit,
     ols_line,
     r2_45,
     r2_ladder,
     simulate_gbm_windows,
     simulate_window,
     simulate_windows,
+    stride_ladder,
     stride_subsamples,
     study_windows,
     synthetic_window_set,
@@ -661,6 +663,29 @@ def test_ols_line():
     np.testing.assert_allclose(betas, [ols_line(y, p)[1], 1.7], rtol=1e-12)
 
 
+def test_ols_fit():
+    rng = np.random.default_rng(17)
+    n = 60
+    X = np.column_stack([np.ones(n), rng.standard_normal((n, 3))])
+    y = X @ np.array([0.2, 1.5, -0.7, 0.3]) + 0.4 * rng.standard_normal(n)
+    coef, r2 = ols_fit(y, X)
+    expected, ssr, *_ = np.linalg.lstsq(X, y, rcond=None)
+    np.testing.assert_allclose(coef, expected, rtol=1e-12)
+    assert r2 == pytest.approx(1.0 - ssr[0] / np.sum((y - y.mean()) ** 2), rel=1e-12)
+    # Stacked resamples along a leading axis match row-by-row fits.
+    idx = block_bootstrap_indices(n, 7, 4, seed=18)
+    coef_b, r2_b = ols_fit(y[idx], X[idx])
+    assert coef_b.shape == (4, 4) and r2_b.shape == (4,)
+    for b in range(4):
+        one, _ = ols_fit(y[idx[b]], X[idx[b]])
+        np.testing.assert_allclose(coef_b[b], one, rtol=1e-12)
+        np.testing.assert_allclose(coef_b[b], np.linalg.lstsq(X[idx[b]], y[idx[b]], rcond=None)[0], rtol=1e-10)
+    # With one regressor and a constant it is ols_line, and its R² is the squared correlation.
+    (alpha, beta), r2_one = ols_fit(y, X[:, :2])
+    assert (alpha, beta) == pytest.approx(ols_line(y, X[:, 1]), rel=1e-12)
+    assert r2_one == pytest.approx(np.corrcoef(y, X[:, 1])[0, 1] ** 2, rel=1e-12)
+
+
 def test_block_bootstrap_indices():
     idx = block_bootstrap_indices(100, 42, 500, seed=12)
     assert idx.shape == (500, 100)
@@ -694,6 +719,28 @@ def test_r2_ladder():
     assert noisy["r2_lo"] < noisy["r2_45"] < noisy["r2_hi"]
     assert noisy["beta_lo"] < noisy["beta"] < noisy["beta_hi"]
     assert r2_ladder(y, {"noisy": p})[["r2_lo", "r2_hi", "beta_lo", "beta_hi"]].isna().all(axis=None)
+
+
+def test_stride_ladder():
+    rng = np.random.default_rng(19)
+    y = rng.standard_normal(12)
+    predictors = {"close": y + 0.3 * rng.standard_normal(12), "far": rng.standard_normal(12)}
+    subsamples = [np.arange(k, 12, 3) for k in range(3)]
+    table = stride_ladder(y, predictors, subsamples)
+    assert list(table.index) == ["close", "far"]
+    for name, p in predictors.items():
+        # Explicit loop over the subsamples.
+        stats = {
+            "r2_45": [r2_45(y[sub], p[sub]) for sub in subsamples],
+            "beta": [ols_line(y[sub], p[sub])[1] for sub in subsamples],
+        }
+        row = table.loc[name]
+        assert row["n_offset0"] == 4
+        for stat, values in stats.items():
+            assert row[f"{stat}_offset0"] == pytest.approx(values[0], rel=1e-12)
+            assert row[f"{stat}_median"] == pytest.approx(np.median(values), rel=1e-12)
+            assert row[f"{stat}_min"] == pytest.approx(min(values), rel=1e-12)
+            assert row[f"{stat}_max"] == pytest.approx(max(values), rel=1e-12)
 
 
 def test_hedging_error_stats():
@@ -746,3 +793,29 @@ def test_weekday_diagnostic(calendar_history):
     total_days = np.sum((dates[win.ends] - dates[win.starts]).days)
     assert table2.loc["All", "calendar_days"] == pytest.approx(total_days / res2.n_intervals.sum(), rel=1e-12)
     assert table2["residual_lo"].isna().all()
+
+
+def test_weekday_diagnostic_bootstrap(calendar_history):
+    # Resamples that repeat and drop windows: each interval must equal the percentile of the
+    # point estimates recomputed on the resampled window sets, one resample at a time.
+    dates = calendar_history.index
+    win = study_windows(calendar_history)
+    S, r = calendar_history["spy"].to_numpy(), calendar_history["r"].to_numpy()
+    res = simulate_windows(S, win.t, r, win.starts, win.ends, win.sigma_i, win.K, h=1, c=0.0)
+    noise = np.random.default_rng(20).standard_normal(res.interval_pnl.shape)
+    pnl = res.interval_p_step + 0.01 * noise  # NaN padding carries over from interval_p_step
+    n_windows = win.starts.size
+    boot = block_bootstrap_indices(n_windows, 5, 40, seed=21)
+    assert not (boot == np.arange(n_windows)).all(axis=1).any()  # no resample is the sample
+    table, _ = weekday_diagnostic(pnl, res.interval_p_step, dates, win.starts, win.ends, 1, boot)
+
+    means = np.array([
+        weekday_diagnostic(pnl[idx], res.interval_p_step[idx], dates, win.starts[idx], win.ends[idx], 1)[0][
+            "residual"
+        ].to_numpy()
+        for idx in boot
+    ])
+    lo, hi = np.percentile(means, [2.5, 97.5], axis=0)
+    np.testing.assert_allclose(table["residual_lo"], lo, rtol=1e-12, atol=1e-15)
+    np.testing.assert_allclose(table["residual_hi"], hi, rtol=1e-12, atol=1e-15)
+    assert (table["residual_hi"] > table["residual_lo"]).all()
