@@ -356,6 +356,26 @@ def test_filter_quotes_counts():
     assert row["kept_puts"] == (STRIKES < F).sum() - 9 and row["kept_calls"] == (STRIKES >= F).sum() - 6
 
 
+def test_chain_summary_counts_no_iv():
+    chain = clean_chain(_synthetic_snapshot(), RATE)
+    before = chain_summary(chain)
+    assert (before["no_IV"] == 0).all()  # a cleaned chain never holds the label
+
+    # Relabel three kept puts and one kept call of 2026-11-20, as the Stage 2c no-IV filter would.
+    kept = chain.index[(chain["expiry"] == "2026-11-20") & (chain["status"] == "kept")]
+    puts = chain.loc[kept, "option_type"] == "put"
+    relabelled = [*kept[puts.to_numpy()][:3], *kept[~puts.to_numpy()][:1]]
+    after = chain_summary(chain.assign(status=chain["status"].where(~chain.index.isin(relabelled), "no IV")))
+    nov, others = after.index == "2026-11-20", after.index != "2026-11-20"
+    assert after.loc[nov, "no_IV"].item() == 4
+    assert after.loc[nov, "kept"].item() == before.loc[nov, "kept"].item() - 4
+    assert after.loc[nov, "kept_puts"].item() == before.loc[nov, "kept_puts"].item() - 3
+    assert after.loc[nov, "kept_calls"].item() == before.loc[nov, "kept_calls"].item() - 1
+    pd.testing.assert_frame_equal(after[others], before[others])
+    unchanged = after.columns.drop(["no_IV", "kept", "kept_puts", "kept_calls", "K_min", "K_max"])
+    pd.testing.assert_frame_equal(after[unchanged], before[unchanged])
+
+
 def test_clean_chain_rejects_bad_snapshots():
     coarse = _synthetic_snapshot(strikes=np.arange(400.0, 600.1, 10.0))  # 480, 490, 500 in the fit band
     with pytest.raises(ValueError, match="2026-10-16: 3 valid pairs"):

@@ -41,7 +41,9 @@ D      : discount factor exp(-rate·T)
 F      : parity forward of the expiry (fixed-D fit, see parity_forward)
 k      : log-moneyness ln(K/F)
 status : 'kept', or the first rule that removed the contract: 'zero bid',
-         'spread', 'open interest', 'in the money'
+         'spread', 'open interest', 'in the money' (Stage 2c relabels kept
+         contracts without an implied vol 'no IV' in the notebook's copy;
+         the frozen file never holds that label)
 
 data/frozen/chain_YYYYMMDD.parquet stores this table, so Table 1 rebuilds
 from data/frozen/ alone. Snapshots collected after 2026-09-30 also carry
@@ -566,7 +568,8 @@ def chain_summary(chain, spot=None):
     Parameters
     ----------
     chain : pd.DataFrame
-        Output of clean_chain or load_chain.
+        Output of clean_chain or load_chain, or a copy whose kept contracts
+        without an implied vol are relabelled 'no IV' (Stage 2c).
     spot : float, optional
         Spot S of the implied carry q, in currency units (snapshot_spot_bar
         gives the spot at the quote time). Defaults to spot_start. The parity
@@ -579,6 +582,8 @@ def chain_summary(chain, spot=None):
         T_days : T in calendar days
         contracts : contracts of the expiry in the snapshot
         zero_bid, spread, open_interest, in_the_money : removals per rule
+        no_IV : kept contracts that the Stage 2c no-IV filter removed
+            (status 'no IV'); 0 on a chain from clean_chain or load_chain
         kept_puts, kept_calls, kept : contracts kept
         K_min, K_max : strike range of the kept contracts
         pairs, pairs_upper : valid pairs with -0.05 <= ln(K/S) <= 0 (the fit)
@@ -597,7 +602,7 @@ def chain_summary(chain, spot=None):
     """
     band_spot = float(chain["spot_start"].iloc[0])
     carry_spot = band_spot if spot is None else float(spot)
-    rules = ["zero bid", "spread", "open interest", "in the money"]
+    rules = ["zero bid", "spread", "open interest", "in the money", "no IV"]
     rows = []
     for expiry, g in chain.groupby("expiry"):
         T, F, D, rate = (float(g[c].iloc[0]) for c in ["T", "F", "D", "rate"])
