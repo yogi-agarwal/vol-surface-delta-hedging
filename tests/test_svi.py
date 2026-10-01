@@ -1,9 +1,12 @@
 import math
+import pathlib
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from volsurf.black_scholes import black76_vega
+from volsurf.implied_vol import black76_implied_vol
 from volsurf.svi import (
     SVIFit,
     fit_svi,
@@ -16,6 +19,8 @@ from volsurf.svi import (
     vega_weights,
 )
 
+FROZEN_CHAIN = pathlib.Path(__file__).resolve().parents[1] / "data" / "frozen" / "chain_20260930.parquet"
+NEAR_TARGET = 1.0  # DESIGN section 7: near-the-money RMSE under 1 vol point on every slice
 CONSTRAINT_TOL = 1e-12  # DESIGN section 7: constraints hold to 1e-12 after the conversion to raw parameters
 BOUND_TOL = 1e-8  # DESIGN section 7: m on its bound, or |rho| on 1, to this tolerance
 CROSS_CHECK_TOL = 1e-10  # DESIGN section 7: the direct fit may not beat the quasi-explicit objective by more
@@ -220,8 +225,35 @@ def test_svi_fit_errors():
     assert errors.band == pytest.approx(0.21, abs=1e-15) and errors.n_near == 3
     assert errors.rmse_near == pytest.approx(math.sqrt((4 + 1 + 1) / 3), abs=1e-12)
     assert errors.rmse_all == pytest.approx(math.sqrt((25 + 4 + 1 + 1) / 4), abs=1e-12)
-    # T scales the vols: the same quotes at T = 0.5 hold vols √2 times lower.
+    # T scales the vols: the same total variances at T = 0.5 are vols √2 times higher, and so are the errors.
     half = svi_fit_errors(k, w, 0.5, flat)
     assert half.rmse_all == pytest.approx(errors.rmse_all * math.sqrt(2), abs=1e-12)
     with pytest.raises(ValueError, match="span k = 0"):
         svi_fit_errors(k[:2], w[:2], 1.0, flat)
+
+
+def test_frozen_svi_fits():
+    # DESIGN section 7 on the 2026-09-30 snapshot: every slice of the frozen chain, fitted from its kept
+    # quotes with an implied vol, satisfies the constraints with m inside its quoted range, passes the
+    # direct cross-check and fits within 1 vol point RMSE near the money.
+    chain = pd.read_parquet(FROZEN_CHAIN)
+    kept = chain[chain["status"] == "kept"].copy()
+    kept["iv"] = black76_implied_vol(
+        kept["mid"], kept["F"], kept["strike"], kept["T"], kept["D"], kept["option_type"] == "call"
+    )
+    kept = kept.dropna(subset=["iv"])
+    kept["w"] = kept["iv"] ** 2 * kept["T"]
+    slices = kept.groupby("expiry")
+    assert len(slices) == 12
+    for expiry, rows in slices:
+        rows = rows.sort_values("k")  # as the notebook fits them
+        k, w, T = rows["k"].to_numpy(), rows["w"].to_numpy(), rows["T"].iloc[0]
+        weights = vega_weights(rows["F"], rows["strike"], rows["T"], rows["D"], rows["iv"])
+        quasi, direct = fit_svi(k, w, weights), fit_svi_direct(k, w, weights)
+        errors = svi_fit_errors(k, w, T, quasi)
+        print(f"{expiry:%Y-%m-%d}: near {errors.rmse_near:.2f}, all {errors.rmse_all:.2f} vol points; "
+              f"direct - quasi-explicit {direct.objective - quasi.objective:.1e}")
+        _assert_feasible(quasi)
+        assert k.min() <= quasi.m <= k.max()
+        assert direct.objective >= quasi.objective - CROSS_CHECK_TOL
+        assert errors.rmse_near < NEAR_TARGET

@@ -2,7 +2,7 @@
 
 SPY implied volatility surface construction and delta-hedging P&L attribution.
 
-**Status:** In progress: history data, pricing, chain cleaning, implied vols, the hedging engine, the real-data hedging study and the OptionMetrics sensitivity complete (Stages 0, 1a, 2a, 2b, 2c, 5a, 5b, 5c); chain collector built, snapshots being collected (1b); surface stages 3 and 4 next.
+**Status:** In progress: history data, pricing, chain cleaning, implied vols, the SVI fits, the hedging engine, the real-data hedging study and the OptionMetrics sensitivity complete (Stages 0, 1a, 2a, 2b, 2c, 3, 5a, 5b, 5c); chain collector built, snapshots being collected (1b); surface stage 4 next.
 
 ## Research question
 
