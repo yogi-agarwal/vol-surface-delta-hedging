@@ -75,6 +75,26 @@ def black76_price(F, K, T, D, sigma, is_call=True):
     return D * w * (F * norm.cdf(w * d1) - K * norm.cdf(w * d2))
 
 
+def black76_vega(F, K, T, D, sigma):
+    """Vega of the Black-76 price, dV/dsigma, identical for calls and puts.
+
+    Parameters
+    ----------
+    F, K, T, D, sigma
+        As in black76_price.
+
+    Returns
+    -------
+    ndarray
+        D·F·φ(d1)·√T, in the currency units of F per unit of volatility (a
+        move of 1.0, that is 100 vol points). With F = S·exp((r - q)T) and
+        D = exp(-rT) it equals bs_vega, since D·F = S·exp(-qT).
+    """
+    F, K, T, D, sigma = (np.asarray(x, dtype=float) for x in (F, K, T, D, sigma))
+    d1, _ = _d1_d2(F, K, T, sigma)
+    return D * F * norm.pdf(d1) * np.sqrt(T)
+
+
 def _spot_inputs(S, K, T, r, q, sigma):
     """Cast spot inputs to float arrays and return them with F and d1, d2."""
     S, K, T, r, q, sigma = (np.asarray(x, dtype=float) for x in (S, K, T, r, q, sigma))
