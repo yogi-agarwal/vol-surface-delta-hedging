@@ -499,7 +499,11 @@ def test_load_minute_bars_rejects_bad_downloads(tmp_path, monkeypatch):
     assert not (tmp_path / "spy_1m_20260930.parquet").exists()
 
 
-def test_snapshot_spot_bar(tmp_path, monkeypatch):
+def _spot_bar_setup(tmp_path, monkeypatch):
+    """A frozen synthetic chain in a temporary data/ tree, with the day's bars frozen and the network blocked.
+
+    Returns the frozen and raw directories, the snapshot path and the frozen bars.
+    """
     frozen, raw_dir = tmp_path / "frozen", tmp_path / "raw"
     frozen.mkdir()
     raw_dir.mkdir()
@@ -519,9 +523,14 @@ def test_snapshot_spot_bar(tmp_path, monkeypatch):
     load_chain(snapshot.name)
     bars = _session_bars()
     bars.index = bars.index.tz_convert("UTC").rename("bar_start")
-    bars[["Open", "High", "Low", "Close", "Volume"]].to_parquet(frozen / "spy_1m_20260930.parquet")
+    bars = bars[["Open", "High", "Low", "Close", "Volume"]]
+    bars.to_parquet(frozen / "spy_1m_20260930.parquet")
     monkeypatch.setattr(yfinance, "Ticker", _no_network)
+    return frozen, raw_dir, snapshot, bars
 
+
+def test_snapshot_spot_bar(tmp_path, monkeypatch):
+    frozen, raw_dir, snapshot, bars = _spot_bar_setup(tmp_path, monkeypatch)
     spots = snapshot_spot_bar(snapshot.name)
     close = bars["Close"].to_numpy()
     assert spots["spot_bar"] == {
@@ -541,6 +550,36 @@ def test_snapshot_spot_bar(tmp_path, monkeypatch):
     (frozen / "manifest.json").write_text(text + "\n")  # a marker that a rewrite would drop
     assert snapshot_spot_bar(snapshot.name) == spots
     assert (frozen / "manifest.json").read_text() == text + "\n"
+
+
+def test_snapshot_spot_bar_prefers_saved_bars(tmp_path, monkeypatch):
+    frozen, raw_dir, snapshot, bars = _spot_bar_setup(tmp_path, monkeypatch)
+    # The bars saved with the pull, up to the last fetch, with closes unlike the frozen file's.
+    saved = raw_dir / "spy_1m_20260930T192047Z.parquet"
+    saved_bars = bars[bars.index <= pd.Timestamp("2026-09-30 19:21", tz="UTC")] + 1.0
+    saved_bars.to_parquet(saved)
+    close, saved_close = bars["Close"].to_numpy(), saved_bars["Close"].to_numpy()
+
+    def _manifest_entry():
+        return json.loads((frozen / "manifest.json").read_text())["chains"]["chain_20260930.parquet"]
+
+    for snap in (snapshot.name, snapshot):  # a bare name and a full path find the same saved file
+        spots = snapshot_spot_bar(snap)
+        assert spots["spot_bar"]["close"] == saved_close[335] and spots["spot_bar_fetch"]["close"] == saved_close[350]
+        assert spots["spot_bar"]["bars"] == spots["spot_bar_fetch"]["bars"] == saved.name
+        assert _manifest_entry()["spot_bar"] == spots["spot_bar"]
+
+    saved.unlink()  # without saved bars, the frozen day file
+    spots = snapshot_spot_bar(snapshot.name)
+    assert spots["spot_bar"]["close"] == close[335] and spots["spot_bar"]["bars"] == "spy_1m_20260930.parquet"
+    assert _manifest_entry()["spot_bar"] == spots["spot_bar"]
+
+    (frozen / "spy_1m_20260930.parquet").unlink()  # without either file, one download, which is frozen
+    fake = _FakeTicker(_session_bars())
+    monkeypatch.setattr(yfinance, "Ticker", lambda ticker: fake)
+    spots = snapshot_spot_bar(snapshot.name)
+    assert len(fake.calls) == 1 and (frozen / "spy_1m_20260930.parquet").exists()
+    assert spots["spot_bar"]["close"] == close[335] and spots["spot_bar"]["bars"] == "spy_1m_20260930.parquet"
 
 
 def test_frozen_spot_bars():

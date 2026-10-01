@@ -57,7 +57,9 @@ Volume                 : shares traded in the bar
 Index                  : DatetimeIndex of bar starts in UTC, named bar_start
 
 data/frozen/spy_1m_YYYYMMDD.parquet stores one day's bars; snapshot_spot_bar
-matches them to a chain snapshot.
+matches them to a chain snapshot. A snapshot collected from 2026-10-01 also
+has the bars saved with its pull, data/raw/spy_1m_YYYYMMDDTHHMMSSZ.parquet
+(same columns and index), which snapshot_spot_bar reads first.
 
 Treasury curve (as returned by load_treasury_curve)
 ---------------------------------------------------
@@ -841,6 +843,12 @@ def snapshot_spot_bar(snapshot, refresh=False):
     in data/frozen/manifest.json only when they are missing or different, so
     a plain read leaves the manifest unchanged.
 
+    The bars come from the first source that exists: the bars saved with the
+    pull, spy_1m_YYYYMMDDTHHMMSSZ.parquet next to the snapshot (under the
+    same UTC timestamp, written by scripts/collect_chain.py from 2026-10-01);
+    then load_minute_bars, which reads data/frozen/spy_1m_YYYYMMDD.parquet
+    and downloads the day only when that file is missing.
+
     Parameters
     ----------
     snapshot : str or pathlib.Path
@@ -848,23 +856,29 @@ def snapshot_spot_bar(snapshot, refresh=False):
         Its cleaned chain must already be frozen and in the manifest.
     refresh : bool
         Passed to load_minute_bars: if True, download the day's bars again.
+        It applies only when the snapshot has no saved bars, because those
+        record the bars as they stood at the pull.
 
     Returns
     -------
     dict
         {"spot_bar": entry, "spot_bar_fetch": entry}. Each entry holds close
         (currency units), bar_start, bar_end and target_utc (ISO 8601 strings
-        in UTC; target_utc is the instant matched) and bars (the frozen bar
-        file's name).
+        in UTC; target_utc is the instant matched) and bars (the name of the
+        bar file read: the saved spy_1m_YYYYMMDDTHHMMSSZ.parquet or the frozen
+        spy_1m_YYYYMMDD.parquet).
 
     Raises
     ------
     ValueError
         If the file name does not match, or the chain is not in the manifest.
     """
-    match = _SNAPSHOT_NAME.fullmatch(pathlib.Path(snapshot).name)
+    path = pathlib.Path(snapshot)
+    match = _SNAPSHOT_NAME.fullmatch(path.name)
     if match is None:
-        raise ValueError(f"{pathlib.Path(snapshot).name} is not a spy_chain_YYYYMMDDTHHMMSSZ.parquet snapshot")
+        raise ValueError(f"{path.name} is not a spy_chain_YYYYMMDDTHHMMSSZ.parquet snapshot")
+    if path.parent == pathlib.Path("."):
+        path = _RAW / path
     name = f"chain_{match.group(1)}.parquet"
     manifest = json.loads(_MANIFEST.read_text()) if _MANIFEST.exists() else {}
     entry = manifest.get("chains", {}).get(name)
@@ -875,7 +889,11 @@ def snapshot_spot_bar(snapshot, refresh=False):
     quote_time = pd.Timestamp(chain["lastTradeDate"].max()).tz_convert("UTC")
     fetch_first = pd.Timestamp(entry["fetch_utc_first"]).tz_convert("UTC")
     day = fetch_first.tz_convert(_NY).normalize().tz_localize(None)
-    bars = load_minute_bars(day, refresh=refresh)
+    saved = path.with_name(path.name.replace("spy_chain_", "spy_1m_", 1))
+    if saved.exists():
+        bars, bars_name = pd.read_parquet(saved), saved.name
+    else:
+        bars, bars_name = load_minute_bars(day, refresh=refresh), f"spy_1m_{day:%Y%m%d}.parquet"
 
     def _entry(when):
         bar = nearest_bar_close(bars, when)
@@ -884,7 +902,7 @@ def snapshot_spot_bar(snapshot, refresh=False):
             "bar_start": bar["bar_start"].isoformat(),
             "bar_end": bar["bar_end"].isoformat(),
             "target_utc": when.isoformat(),
-            "bars": f"spy_1m_{day:%Y%m%d}.parquet",
+            "bars": bars_name,
         }
 
     spots = {"spot_bar": _entry(quote_time), "spot_bar_fetch": _entry(fetch_first)}
