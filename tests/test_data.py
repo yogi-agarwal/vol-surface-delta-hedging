@@ -25,6 +25,11 @@ from volsurf.data import (
 )
 
 FROZEN_HISTORY = pathlib.Path(__file__).resolve().parents[1] / "data" / "frozen" / "history.parquet"
+FROZEN_CHAIN = FROZEN_HISTORY.with_name("chain_20260930.parquet")
+RAW_COLUMNS = [  # columns written by scripts/collect_chain.py
+    "contractSymbol", "strike", "bid", "ask", "lastPrice", "volume", "openInterest", "lastTradeDate",
+    "expiry", "option_type", "fetch_utc", "spot_start", "spot_end",
+]
 OM_STD, OM_SURFACE = "om_spy_std_30d_2021_2025.csv", "om_spy_volsurf_2021_2025.csv"
 
 
@@ -378,3 +383,22 @@ def test_load_chain_builds_and_reads_frozen(tmp_path, monkeypatch):
     pd.testing.assert_frame_equal(load_chain(snapshot), chain)
     with pytest.raises(ValueError, match="spy_chain"):
         load_chain(raw_dir / "chain.parquet")
+
+
+def test_frozen_chain_integrity(history):
+    chain = pd.read_parquet(FROZEN_CHAIN)
+    summary = chain_summary(chain)
+    assert 8 <= len(summary) <= 12 and (summary["T_days"] >= 7).all()
+    assert monthly_expiries(summary.index).all()
+    assert (summary["pairs"] >= 6).all()
+    assert set(chain["status"]) <= {"kept", "zero bid", "spread", "open interest", "in the money"}
+    kept = chain[chain["status"] == "kept"]
+    assert (kept["strike"] < kept["F"]).eq(kept["option_type"] == "put").all()
+    assert (filter_quotes(kept["bid"], kept["ask"], kept["openInterest"]) == "kept").all()
+    np.testing.assert_allclose(chain["k"], np.log(chain["strike"] / chain["F"]), rtol=0, atol=0)
+    np.testing.assert_allclose(chain["D"], np.exp(-chain["rate"] * chain["T"]), rtol=0, atol=0)
+    assert (chain["rate"] == history.loc["2026-09-29", "r"]).all()
+
+    # Cleaning the frozen quotes again reproduces the frozen table exactly.
+    raw = chain[RAW_COLUMNS].assign(expiry=chain["expiry"].dt.strftime("%Y-%m-%d"))
+    pd.testing.assert_frame_equal(clean_chain(raw, chain["rate"].iloc[0]), chain)
