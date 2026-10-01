@@ -661,6 +661,50 @@ def test_clean_chain_with_rate_curve():
     assert chain.groupby("expiry")["rate"].nunique().eq(1).all()
 
 
+def test_chain_summary_one_sided_diagnostic():
+    # Strikes 4 apart: 7 pairs from 476 to 500 lie in the fixed-D fit band, enough for the fit
+    # (6) but not for the one-sided free-slope diagnostic (8) until the band widens with T.
+    strikes = np.arange(400.0, 600.1, 4.0)
+    summary = chain_summary(clean_chain(_synthetic_snapshot(strikes=strikes), RATE))
+    T = summary["T_days"].to_numpy() / 365
+    x = np.log(strikes / SPOT)
+    expected = [int(((x >= -max(0.05, 0.1 * np.sqrt(t))) & (x <= 0)).sum()) for t in T]
+    assert summary["pairs_one_sided"].tolist() == expected
+    assert expected[0] == 7 and expected[-1] > 8
+    defined = summary["pairs_one_sided"] >= 8
+    assert summary.loc[~defined, ["D_one_sided", "r_one_sided"]].isna().all().all()
+    # European quotes satisfy parity exactly, so the free slope gives back D and the rate.
+    np.testing.assert_allclose(summary.loc[defined, "D_one_sided"], np.exp(-RATE * T[defined]), rtol=0, atol=1e-10)
+    np.testing.assert_allclose(summary.loc[defined, "r_one_sided"], RATE, rtol=0, atol=1e-8)
+    assert (summary["rate"] == RATE).all()
+
+
+def test_chain_summary_spot_sets_the_carry_only():
+    chain = clean_chain(_synthetic_snapshot(), RATE)
+    default, moved = chain_summary(chain), chain_summary(chain, spot=505.0)
+    pd.testing.assert_frame_equal(chain_summary(chain, spot=SPOT), default)  # SPOT is the snapshot's spot_start
+    T = default["T_days"] / 365
+    np.testing.assert_allclose(moved["q"], RATE - np.log(default["F"] / 505.0) / T, rtol=0, atol=1e-15)
+    others = default.columns.drop("q")
+    pd.testing.assert_frame_equal(moved[others], default[others])
+
+
+def test_frozen_rate_choice(history):
+    # DESIGN section 5: the Treasury curve becomes the default D only if the implied carry of every
+    # expiry after 2026-12-18 lies within 0.8% to 1.6% a year, with S = spot_bar. On the 2026-09-30
+    # snapshot it does not, so the frozen chain keeps the flat ^IRX rate.
+    chain = pd.read_parquet(FROZEN_CHAIN)
+    spot_bar = json.loads(FROZEN_MANIFEST.read_text())["chains"][FROZEN_CHAIN.name]["spot_bar"]["close"]
+    curve = pd.read_csv(FROZEN_CURVE, index_col="date", parse_dates=["date"])
+    _, tenors, rates = treasury_rates(curve, "2026-09-30")
+    raw = chain[RAW_COLUMNS].assign(expiry=chain["expiry"].dt.strftime("%Y-%m-%d"))
+    treasury = chain_summary(clean_chain(raw, lambda T: interp_rate(T, tenors, rates)), spot=spot_bar)
+    q = treasury.loc[treasury.index > "2026-12-18", "q"]
+    assert len(q) == 9
+    assert not q.between(0.008, 0.016).all()
+    assert (chain["rate"] == history.loc["2026-09-29", "r"]).all()
+
+
 def test_frozen_treasury_curve():
     curve = pd.read_csv(FROZEN_CURVE, index_col="date", parse_dates=["date"])
     entry = json.loads(FROZEN_MANIFEST.read_text())["curves"][FROZEN_CURVE.name]

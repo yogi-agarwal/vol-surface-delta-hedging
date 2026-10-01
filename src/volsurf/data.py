@@ -94,7 +94,8 @@ _SLICES = (8, 12)  # allowed number of selected expiries
 _LONG_MONTHS = (1, 3, 6, 9, 12)  # LEAPS (January) and quarterly months kept beyond 1 year
 _BAND = 0.05  # |ln(K/S)| band of the parity fits
 _MIN_PAIRS = 6  # fixed-D forward fit, -0.05 <= ln(K/S) <= 0
-_MIN_PAIRS_FREE = 8  # free-slope diagnostic, |ln(K/S)| <= 0.05
+_MIN_PAIRS_FREE = 8  # free-slope diagnostics, two-sided and one-sided
+_ONE_SIDED_SCALE = 0.1  # one-sided diagnostic band: -max(0.05, 0.1·√T) <= ln(K/S) <= 0
 _MAX_SPREAD = 0.25  # largest (ask - bid)/mid kept
 _MIN_OPEN_INTEREST = 10
 _RATE_MAX_AGE_DAYS = 5  # the ^IRX close may precede the snapshot by at most this many days
@@ -557,13 +558,17 @@ def clean_chain(raw, rate):
     return chain
 
 
-def chain_summary(chain):
+def chain_summary(chain, spot=None):
     """Table 1 per expiry, computed from a cleaned chain alone.
 
     Parameters
     ----------
     chain : pd.DataFrame
         Output of clean_chain or load_chain.
+    spot : float, optional
+        Spot S of the implied carry q, in currency units (snapshot_spot_bar
+        gives the spot at the quote time). Defaults to spot_start. The parity
+        bands always use spot_start, as clean_chain does.
 
     Returns
     -------
@@ -576,15 +581,20 @@ def chain_summary(chain):
         K_min, K_max : strike range of the kept contracts
         pairs, pairs_upper : valid pairs with -0.05 <= ln(K/S) <= 0 (the fit)
             and with 0 < ln(K/S) <= 0.05 (excluded from the fit)
-        F, D : forward and discount factor used downstream
-        q : implied carry rate - ln(F/S)/T, as a decimal
+        F, D, rate : forward, discount factor and rate used downstream
+        q : implied carry rate - ln(F/S)/T, as a decimal, with S = spot
         within, within_upper : share of those pairs whose parity residual
             lies within the combined half-spread (NaN without pairs)
         F_free, D_free, r_free : free-slope parity fit over |ln(K/S)| <= 0.05
             and its implied rate -ln(D_free)/T (NaN with fewer than 8 pairs);
             a diagnostic only
+        pairs_one_sided, D_one_sided, r_one_sided : valid pairs with
+            -max(0.05, 0.1·√T) <= ln(K/S) <= 0, where the put is out of the
+            money, their free-slope parity D and its implied rate
+            -ln(D_one_sided)/T (NaN with fewer than 8 pairs); a diagnostic only
     """
-    spot = float(chain["spot_start"].iloc[0])
+    band_spot = float(chain["spot_start"].iloc[0])
+    carry_spot = band_spot if spot is None else float(spot)
     rules = ["zero bid", "spread", "open interest", "in the money"]
     rows = []
     for expiry, g in chain.groupby("expiry"):
@@ -592,13 +602,16 @@ def chain_summary(chain):
         kept = g[g["status"] == "kept"]
         removed = g["status"].value_counts()
         K, *quotes = _parity_pairs(g)
-        x = np.log(K / spot)
+        x = np.log(K / band_spot)
         fit, upper, both = (x >= -_BAND) & (x <= 0), (x > 0) & (x <= _BAND), np.abs(x) <= _BAND
+        one_sided = (x >= -max(_BAND, _ONE_SIDED_SCALE * np.sqrt(T))) & (x <= 0)
         residual, half_spread = parity_residuals(K, *quotes, F, D)
         within = np.abs(residual) <= half_spread
-        F_free, D_free = np.nan, np.nan
+        F_free, D_free, D_one_sided = np.nan, np.nan, np.nan
         if both.sum() >= _MIN_PAIRS_FREE:
             F_free, D_free = parity_forward(K[both], *(q[both] for q in quotes))
+        if one_sided.sum() >= _MIN_PAIRS_FREE:
+            _, D_one_sided = parity_forward(K[one_sided], *(q[one_sided] for q in quotes))
         rows.append({
             "expiry": expiry,
             "T_days": 365 * T,
@@ -613,12 +626,16 @@ def chain_summary(chain):
             "pairs_upper": int(upper.sum()),
             "F": F,
             "D": D,
-            "q": rate - np.log(F / spot) / T,
+            "rate": rate,
+            "q": rate - np.log(F / carry_spot) / T,
             "within": within[fit].mean() if fit.any() else np.nan,
             "within_upper": within[upper].mean() if upper.any() else np.nan,
             "F_free": F_free,
             "D_free": D_free,
             "r_free": -np.log(D_free) / T,
+            "pairs_one_sided": int(one_sided.sum()),
+            "D_one_sided": D_one_sided,
+            "r_one_sided": -np.log(D_one_sided) / T,
         })
     return pd.DataFrame(rows).set_index("expiry")
 
