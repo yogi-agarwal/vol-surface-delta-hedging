@@ -16,16 +16,21 @@ from volsurf.data import (
     irx_to_rate,
     load_chain,
     load_history,
+    load_minute_bars,
     load_optionmetrics,
     monthly_expiries,
+    nearest_bar_close,
     parity_forward,
     parity_residuals,
     select_expiries,
+    snapshot_spot_bar,
     time_to_expiry,
 )
 
 FROZEN_HISTORY = pathlib.Path(__file__).resolve().parents[1] / "data" / "frozen" / "history.parquet"
 FROZEN_CHAIN = FROZEN_HISTORY.with_name("chain_20260930.parquet")
+FROZEN_BARS = FROZEN_HISTORY.with_name("spy_1m_20260930.parquet")
+FROZEN_MANIFEST = FROZEN_HISTORY.with_name("manifest.json")
 RAW_COLUMNS = [  # columns written by scripts/collect_chain.py
     "contractSymbol", "strike", "bid", "ask", "lastPrice", "volume", "openInterest", "lastTradeDate",
     "expiry", "option_type", "fetch_utc", "spot_start", "spot_end",
@@ -402,3 +407,147 @@ def test_frozen_chain_integrity(history):
     # Cleaning the frozen quotes again reproduces the frozen table exactly.
     raw = chain[RAW_COLUMNS].assign(expiry=chain["expiry"].dt.strftime("%Y-%m-%d"))
     pd.testing.assert_frame_equal(clean_chain(raw, chain["rate"].iloc[0]), chain)
+
+
+# SPY 1-minute bars: a mocked regular session of 2026-09-30, 13:30 to 19:59 UTC (09:30 to 15:59 in New York).
+def _session_bars(day="2026-09-30"):
+    index = pd.date_range(f"{day} 09:30", f"{day} 15:59", freq="1min", tz="America/New_York")
+    close = 760.0 + 0.01 * np.arange(index.size)  # a distinct close per bar
+    return pd.DataFrame(
+        {"Open": close, "High": close, "Low": close, "Close": close, "Adj Close": close, "Volume": 1000,
+         "Dividends": 0.0, "Stock Splits": 0.0, "Capital Gains": 0.0},
+        index=index.rename("Datetime"),
+    )
+
+
+class _FakeTicker:
+    """Stands in for yfinance.Ticker: history returns a fixed frame and records its arguments."""
+
+    def __init__(self, frame):
+        self.frame, self.calls = frame, []
+
+    def history(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.frame
+
+
+def _no_network(ticker):
+    raise RuntimeError("network call made")
+
+
+def test_nearest_bar_close():
+    bars = _session_bars()
+    close = bars["Close"].to_numpy()
+    # 19:20:47 UTC: the 19:20 bar closes at 19:21:00, 13 s away. The 19:21 label is nearer, but
+    # that bar closes at 19:22:00.
+    bar = nearest_bar_close(bars, pd.Timestamp("2026-09-30 19:20:47.67", tz="UTC"))
+    assert bar["bar_start"] == pd.Timestamp("2026-09-30 19:20", tz="UTC")
+    assert bar["bar_end"] == pd.Timestamp("2026-09-30 19:21", tz="UTC")
+    assert bar["close"] == close[350]  # 15:20 in New York is bar 350 counted from 0 at 09:30
+    # A tz-naive instant is read as UTC: 19:05:42 matches the 15:05 New York bar.
+    assert nearest_bar_close(bars, pd.Timestamp("2026-09-30 19:05:42"))["close"] == close[335]
+    # 19:20:30 lies exactly between the ends of the 19:19 and 19:20 bars: the earlier bar wins.
+    tie = nearest_bar_close(bars, "2026-09-30 19:20:30+00:00")
+    assert tie["bar_start"] == pd.Timestamp("2026-09-30 19:19", tz="UTC")
+    # Before the open and after the close: the first and the last bar.
+    assert nearest_bar_close(bars, "2026-09-30 12:00+00:00")["close"] == close[0]
+    assert nearest_bar_close(bars, "2026-09-30 22:00+00:00")["close"] == close[-1]
+    with pytest.raises(ValueError, match="no bars"):
+        nearest_bar_close(bars.iloc[:0], "2026-09-30 19:20+00:00")
+
+
+def test_load_minute_bars_download_and_frozen_read(tmp_path, monkeypatch):
+    monkeypatch.setattr(volsurf.data, "_FROZEN", tmp_path)
+    monkeypatch.setattr(volsurf.data, "_MANIFEST", tmp_path / "manifest.json")
+    (tmp_path / "manifest.json").write_text(json.dumps({"tickers": ["SPY"]}))
+    fake = _FakeTicker(_session_bars())
+    monkeypatch.setattr(yfinance, "Ticker", lambda ticker: fake)
+
+    bars = load_minute_bars("2026-09-30")
+    assert fake.calls == [{"start": "2026-09-30", "end": "2026-10-01", "interval": "1m", "auto_adjust": False}]
+    assert bars.columns.tolist() == ["Open", "High", "Low", "Close", "Volume"]
+    assert bars.index.name == "bar_start" and str(bars.index.tz) == "UTC"
+    assert bars.index[0] == pd.Timestamp("2026-09-30 13:30", tz="UTC") and len(bars) == 390
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    entry = manifest["minute_bars"]["spy_1m_20260930.parquet"]
+    assert manifest["tickers"] == ["SPY"]  # other keys are kept
+    assert entry["row_count"] == 390 and entry["date"] == "2026-09-30" and entry["auto_adjust"] is False
+    assert entry["first_bar"] == "2026-09-30T13:30:00+00:00" and entry["last_bar"] == "2026-09-30T19:59:00+00:00"
+
+    monkeypatch.setattr(yfinance, "Ticker", _no_network)
+    pd.testing.assert_frame_equal(load_minute_bars(pd.Timestamp("2026-09-30")), bars)  # the frozen file
+
+
+def test_load_minute_bars_rejects_bad_downloads(tmp_path, monkeypatch):
+    monkeypatch.setattr(volsurf.data, "_FROZEN", tmp_path)
+    monkeypatch.setattr(volsurf.data, "_MANIFEST", tmp_path / "manifest.json")
+    monkeypatch.setattr(yfinance, "Ticker", lambda ticker: _FakeTicker(_session_bars().iloc[:0]))
+    with pytest.raises(ValueError, match="no SPY 1-minute bars for 2026-09-30"):
+        load_minute_bars("2026-09-30")
+    monkeypatch.setattr(yfinance, "Ticker", lambda ticker: _FakeTicker(_session_bars("2026-09-29")))
+    with pytest.raises(ValueError, match="outside 2026-09-30"):
+        load_minute_bars("2026-09-30")
+    assert not (tmp_path / "spy_1m_20260930.parquet").exists()
+
+
+def test_snapshot_spot_bar(tmp_path, monkeypatch):
+    frozen, raw_dir = tmp_path / "frozen", tmp_path / "raw"
+    frozen.mkdir()
+    raw_dir.mkdir()
+    monkeypatch.setattr(volsurf.data, "_FROZEN", frozen)
+    monkeypatch.setattr(volsurf.data, "_MANIFEST", frozen / "manifest.json")
+    monkeypatch.setattr(volsurf.data, "_RAW", raw_dir)
+    snapshot = raw_dir / "spy_chain_20260930T192047Z.parquet"
+    with pytest.raises(ValueError, match="not in the manifest"):
+        snapshot_spot_bar(snapshot)
+
+    # The latest trade of the selected expiries is 19:05:42; a later one on an unselected expiry is ignored.
+    raw = _synthetic_snapshot()
+    raw["lastTradeDate"] = pd.Timestamp("2026-09-30 18:00", tz="UTC")
+    raw.loc[raw["expiry"] == "2026-11-20", "lastTradeDate"] = pd.Timestamp("2026-09-30 19:05:42", tz="UTC")
+    raw.loc[raw["expiry"] == "2026-10-02", "lastTradeDate"] = pd.Timestamp("2026-09-30 19:12", tz="UTC")
+    raw.to_parquet(snapshot)
+    load_chain(snapshot.name)
+    bars = _session_bars()
+    bars.index = bars.index.tz_convert("UTC").rename("bar_start")
+    bars[["Open", "High", "Low", "Close", "Volume"]].to_parquet(frozen / "spy_1m_20260930.parquet")
+    monkeypatch.setattr(yfinance, "Ticker", _no_network)
+
+    spots = snapshot_spot_bar(snapshot.name)
+    close = bars["Close"].to_numpy()
+    assert spots["spot_bar"] == {
+        "close": close[335],
+        "bar_start": "2026-09-30T19:05:00+00:00",
+        "bar_end": "2026-09-30T19:06:00+00:00",
+        "target_utc": "2026-09-30T19:05:42+00:00",
+        "bars": "spy_1m_20260930.parquet",
+    }
+    assert spots["spot_bar_fetch"]["close"] == close[350]  # nearest the first fetch, 19:20:47
+    assert spots["spot_bar_fetch"]["target_utc"] == FETCH.isoformat()
+    entry = json.loads((frozen / "manifest.json").read_text())["chains"]["chain_20260930.parquet"]
+    assert entry["spot_bar"] == spots["spot_bar"] and entry["spot_bar_fetch"] == spots["spot_bar_fetch"]
+    assert entry["snapshot"] == snapshot.name  # the rest of the entry is kept
+
+    text = (frozen / "manifest.json").read_text()
+    (frozen / "manifest.json").write_text(text + "\n")  # a marker that a rewrite would drop
+    assert snapshot_spot_bar(snapshot.name) == spots
+    assert (frozen / "manifest.json").read_text() == text + "\n"
+
+
+def test_frozen_spot_bars():
+    bars = pd.read_parquet(FROZEN_BARS)
+    manifest = json.loads(FROZEN_MANIFEST.read_text())
+    assert len(bars) == manifest["minute_bars"][FROZEN_BARS.name]["row_count"]
+    assert bars.index.is_unique and bars.index.is_monotonic_increasing
+    days = bars.index.tz_convert("America/New_York").normalize().tz_localize(None)
+    assert (days == pd.Timestamp("2026-09-30")).all()
+    entry = manifest["chains"][FROZEN_CHAIN.name]
+    targets = {
+        "spot_bar": pd.read_parquet(FROZEN_CHAIN)["lastTradeDate"].max(),  # the quote time
+        "spot_bar_fetch": pd.Timestamp(entry["fetch_utc_first"]),
+    }
+    for key, target in targets.items():
+        bar = nearest_bar_close(bars, target)
+        assert entry[key]["close"] == bar["close"] and entry[key]["bar_start"] == bar["bar_start"].isoformat()
+        assert entry[key]["target_utc"] == target.tz_convert("UTC").isoformat()
+        assert abs(bar["bar_end"] - target) <= pd.Timedelta(seconds=30)

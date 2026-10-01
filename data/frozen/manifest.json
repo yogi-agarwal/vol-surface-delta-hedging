@@ -40,7 +40,34 @@
       ],
       "raw_rows": 9815,
       "row_count": 4625,
-      "kept": 2245
+      "kept": 2245,
+      "spot_bar": {
+        "close": 766.7000122070312,
+        "bar_start": "2026-09-30T19:05:00+00:00",
+        "bar_end": "2026-09-30T19:06:00+00:00",
+        "target_utc": "2026-09-30T19:05:42+00:00",
+        "bars": "spy_1m_20260930.parquet"
+      },
+      "spot_bar_fetch": {
+        "close": 766.5700073242188,
+        "bar_start": "2026-09-30T19:20:00+00:00",
+        "bar_end": "2026-09-30T19:21:00+00:00",
+        "target_utc": "2026-09-30T19:20:47.665955+00:00",
+        "bars": "spy_1m_20260930.parquet"
+      }
+    }
+  },
+  "minute_bars": {
+    "spy_1m_20260930.parquet": {
+      "utc_timestamp": "2026-10-01T04:01:36.114662+00:00",
+      "ticker": "SPY",
+      "yfinance_version": "1.7.0",
+      "interval": "1m",
+      "auto_adjust": false,
+      "date": "2026-09-30",
+      "first_bar": "2026-09-30T13:30:00+00:00",
+      "last_bar": "2026-09-30T19:59:00+00:00",
+      "row_count": 390
     }
   }
 }

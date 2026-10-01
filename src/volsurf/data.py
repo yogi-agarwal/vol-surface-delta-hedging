@@ -43,7 +43,20 @@ status : 'kept', or the first rule that removed the contract: 'zero bid',
          'spread', 'open interest', 'in the money'
 
 data/frozen/chain_YYYYMMDD.parquet stores this table, so Table 1 rebuilds
-from data/frozen/ alone.
+from data/frozen/ alone. Snapshots collected after 2026-09-30 also carry
+spot_bar_start, spot_bar_end (closes of the latest SPY 1-minute bar at the
+start and end of the pull) and spot_bar_start_utc, spot_bar_end_utc (those
+bars' start times).
+
+Minute bars (as returned by load_minute_bars)
+---------------------------------------------
+Open, High, Low, Close : unadjusted SPY prices of each regular-session
+                         1-minute bar
+Volume                 : shares traded in the bar
+Index                  : DatetimeIndex of bar starts in UTC, named bar_start
+
+data/frozen/spy_1m_YYYYMMDD.parquet stores one day's bars; snapshot_spot_bar
+matches them to a chain snapshot.
 """
 
 import json
@@ -76,6 +89,8 @@ _MAX_SPREAD = 0.25  # largest (ask - bid)/mid kept
 _MIN_OPEN_INTEREST = 10
 _RATE_MAX_AGE_DAYS = 5  # the ^IRX close may precede the snapshot by at most this many days
 _SNAPSHOT_NAME = re.compile(r"spy_chain_(\d{8})T\d{6}Z\.parquet")
+_BAR = pd.Timedelta(minutes=1)  # Yahoo 1-minute bars, labelled by their opening minute
+_BAR_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
 
 _RAW = _REPO / "data" / "raw"
 _OM_STD = "om_spy_std_30d_2021_2025.csv"  # standardised options, 30-day ATM-forward
@@ -682,3 +697,165 @@ def load_chain(snapshot, refresh=False):
         "kept": int((chain["status"] == "kept").sum()),
     }}})
     return chain
+
+
+def nearest_bar_close(bars, when):
+    """The 1-minute bar whose close is struck nearest an instant.
+
+    Yahoo labels a bar by its opening minute: bar t covers [t, t + 1 min) and
+    its close is the last trade before t + 1 min. The match is on that end
+    time; matching the labels would pick a bar whose close comes up to a
+    minute after the instant.
+
+    Parameters
+    ----------
+    bars : pd.DataFrame
+        1-minute bars on a tz-aware DatetimeIndex of bar starts, with a Close
+        column in currency units (load_minute_bars).
+    when : datetime-like
+        The instant, tz-aware (tz-naive values are read as UTC).
+
+    Returns
+    -------
+    dict
+        close : float, the matched bar's close
+        bar_start, bar_end : pd.Timestamp, the matched bar's start and end in UTC
+        Ties go to the earlier bar.
+
+    Raises
+    ------
+    ValueError
+        If bars is empty.
+    """
+    if bars.empty:
+        raise ValueError("no bars to match")
+    bars = bars.sort_index()
+    starts = pd.DatetimeIndex(bars.index).tz_convert("UTC")
+    ends = starts + _BAR
+    when = pd.Timestamp(when)
+    when = when.tz_localize("UTC") if when.tzinfo is None else when.tz_convert("UTC")
+    i = int(np.argmin(np.abs((ends - when).to_numpy())))
+    return {"close": float(bars["Close"].iloc[i]), "bar_start": starts[i], "bar_end": ends[i]}
+
+
+def load_minute_bars(date, refresh=False):
+    """SPY 1-minute bars of one New York trading day, read from data/frozen/ or downloaded.
+
+    The frozen file is data/frozen/spy_1m_YYYYMMDD.parquet. It is downloaded
+    from yfinance (regular session, unadjusted) only when it is missing or
+    refresh is True, and the download is recorded under "minute_bars" in
+    data/frozen/manifest.json. Yahoo keeps 1-minute bars for about 30 days.
+
+    Parameters
+    ----------
+    date : date-like
+        The New York trading day.
+    refresh : bool
+        If True, download again and overwrite the frozen file.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per bar on a DatetimeIndex of bar starts in UTC, named
+        bar_start, with columns Open, High, Low, Close (currency units) and
+        Volume (shares).
+
+    Raises
+    ------
+    ValueError
+        If a download returns no bars or a bar outside the New York date.
+    """
+    day = pd.Timestamp(date).normalize()
+    path = _FROZEN / f"spy_1m_{day:%Y%m%d}.parquet"
+    if not refresh and path.exists():
+        return pd.read_parquet(path)
+
+    raw = yfinance.Ticker("SPY").history(
+        start=f"{day:%Y-%m-%d}", end=f"{day + pd.Timedelta(days=1):%Y-%m-%d}", interval="1m", auto_adjust=False
+    )
+    if raw.empty:
+        raise ValueError(f"no SPY 1-minute bars for {day.date()}; Yahoo keeps them for about 30 days")
+    index = pd.DatetimeIndex(raw.index)
+    if not (index.tz_convert(_NY).normalize().tz_localize(None) == day).all():
+        raise ValueError(f"the download holds bars outside {day.date()} in New York")
+    bars = raw[_BAR_COLUMNS].copy()
+    bars.index = pd.DatetimeIndex(index.tz_convert("UTC"), freq=None, name="bar_start")  # as read back from parquet
+
+    _FROZEN.mkdir(parents=True, exist_ok=True)
+    bars.to_parquet(path)
+    _update_manifest({"minute_bars": {path.name: {
+        "utc_timestamp": datetime.now(timezone.utc).isoformat(),
+        "ticker": "SPY",
+        "yfinance_version": yfinance.__version__,
+        "interval": "1m",
+        "auto_adjust": False,
+        "date": str(day.date()),
+        "first_bar": bars.index[0].isoformat(),
+        "last_bar": bars.index[-1].isoformat(),
+        "row_count": len(bars),
+    }}})
+    return bars
+
+
+def snapshot_spot_bar(snapshot, refresh=False):
+    """Spot of a chain snapshot from SPY 1-minute bars, recorded in its manifest entry.
+
+    Yahoo's option quotes lag the fetch by about 15 minutes, so the quotes are
+    matched to the spot at the latest option trade in the cleaned chain (the
+    quote time), not at the fetch. Two bar closes are taken with
+    nearest_bar_close: spot_bar, nearest the quote time, which Table 1's carry
+    uses, and spot_bar_fetch, nearest the snapshot's first fetch
+    (fetch_utc_first in the manifest). Both are written to the chain's entry
+    in data/frozen/manifest.json only when they are missing or different, so
+    a plain read leaves the manifest unchanged.
+
+    Parameters
+    ----------
+    snapshot : str or pathlib.Path
+        Raw snapshot spy_chain_YYYYMMDDTHHMMSSZ.parquet, as for load_chain.
+        Its cleaned chain must already be frozen and in the manifest.
+    refresh : bool
+        Passed to load_minute_bars: if True, download the day's bars again.
+
+    Returns
+    -------
+    dict
+        {"spot_bar": entry, "spot_bar_fetch": entry}. Each entry holds close
+        (currency units), bar_start, bar_end and target_utc (ISO 8601 strings
+        in UTC; target_utc is the instant matched) and bars (the frozen bar
+        file's name).
+
+    Raises
+    ------
+    ValueError
+        If the file name does not match, or the chain is not in the manifest.
+    """
+    match = _SNAPSHOT_NAME.fullmatch(pathlib.Path(snapshot).name)
+    if match is None:
+        raise ValueError(f"{pathlib.Path(snapshot).name} is not a spy_chain_YYYYMMDDTHHMMSSZ.parquet snapshot")
+    name = f"chain_{match.group(1)}.parquet"
+    manifest = json.loads(_MANIFEST.read_text()) if _MANIFEST.exists() else {}
+    entry = manifest.get("chains", {}).get(name)
+    if entry is None:
+        raise ValueError(f"{name} is not in the manifest; build it with load_chain first")
+
+    chain = load_chain(snapshot)
+    quote_time = pd.Timestamp(chain["lastTradeDate"].max()).tz_convert("UTC")
+    fetch_first = pd.Timestamp(entry["fetch_utc_first"]).tz_convert("UTC")
+    day = fetch_first.tz_convert(_NY).normalize().tz_localize(None)
+    bars = load_minute_bars(day, refresh=refresh)
+
+    def _entry(when):
+        bar = nearest_bar_close(bars, when)
+        return {
+            "close": bar["close"],
+            "bar_start": bar["bar_start"].isoformat(),
+            "bar_end": bar["bar_end"].isoformat(),
+            "target_utc": when.isoformat(),
+            "bars": f"spy_1m_{day:%Y%m%d}.parquet",
+        }
+
+    spots = {"spot_bar": _entry(quote_time), "spot_bar_fetch": _entry(fetch_first)}
+    if any(entry.get(key) != value for key, value in spots.items()):
+        _update_manifest({"chains": {name: {**entry, **spots}}})
+    return spots
