@@ -174,7 +174,8 @@ def test_fetch_chain_records_bar_spots(monkeypatch):
     monkeypatch.setattr(_cc.yf, "Ticker", lambda ticker: fake)
     monkeypatch.setattr(_cc.time, "sleep", lambda seconds: None)
 
-    spot_start, spot_end, df = _cc._fetch_chain("SPY")
+    spot_start, spot_end, df, bars = _cc._fetch_chain("SPY")
+    assert bars is end_bars  # the frame read at the end of the pull, for _save_bars
     assert spot_start == spot_end == 700.0
     assert (df["spot_start"] == 700.0).all() and (df["spot_end"] == 700.0).all()  # the quote is kept
     assert (df["spot_bar_start"] == 701.25).all() and (df["spot_bar_end"] == 701.75).all()
@@ -189,7 +190,89 @@ def test_fetch_chain_survives_a_failed_bar_request(monkeypatch):
     monkeypatch.setattr(_cc.yf, "Ticker", lambda ticker: fake)
     monkeypatch.setattr(_cc.time, "sleep", lambda seconds: None)
 
-    _, _, df = _cc._fetch_chain("SPY")
+    _, _, df, bars = _cc._fetch_chain("SPY")
+    assert bars.empty
     assert df["spot_bar_start"].isna().all() and df["spot_bar_end"].isna().all()
     assert df["spot_bar_start_utc"].isna().all() and df["spot_bar_end_utc"].isna().all()
     assert str(df["spot_bar_start_utc"].dtype) == "datetime64[ns, UTC]"
+
+
+# ---------------------------------------------------------------------------
+# The day's 1-minute bars saved next to the chain
+# ---------------------------------------------------------------------------
+
+def _yahoo_bars(closes: list[float], first: datetime) -> pd.DataFrame:
+    """A mocked yfinance history frame with all its columns, indexed by bar start in New York time."""
+    bars = _bars(closes, first)
+    for column in ("Adj Close", "Dividends", "Stock Splits", "Capital Gains"):
+        bars[column] = 0.0
+    return bars
+
+
+def test_bars_up_to():
+    bars = _yahoo_bars([766.6, 766.7, 766.57, 766.5, 766.56], _ny(*MON, 15, 18))  # 19:18 to 19:22 UTC
+    kept = _cc.bars_up_to(bars, pd.Timestamp("2026-09-28 19:20:47", tz="UTC"))
+    assert kept.columns.tolist() == ["Open", "High", "Low", "Close", "Volume"]
+    assert kept.index.name == "bar_start" and str(kept.index.tz) == "UTC" and kept.index.freq is None
+    assert kept.index.tolist() == [pd.Timestamp(f"2026-09-28 19:{m}", tz="UTC") for m in (18, 19, 20)]
+    assert kept["Close"].tolist() == [766.6, 766.7, 766.57]
+    # An instant in another time zone is the same instant.
+    same = _cc.bars_up_to(bars, pd.Timestamp("2026-09-28 15:20:47", tz="America/New_York"))
+    pd.testing.assert_frame_equal(same, kept)
+
+
+def test_save_bars_writes_the_bars_up_to_the_fetch(tmp_path):
+    bars = _yahoo_bars([766.6, 766.7, 766.57, 766.5], _ny(*MON, 15, 18))
+    until = pd.Timestamp("2026-09-28 19:20:47", tz="UTC")
+    path = tmp_path / "spy_1m_20260928T192047Z.parquet"
+    note = _cc._save_bars(bars, until, path)
+    assert note == "spy_1m_20260928T192047Z.parquet (3 bars, last 19:20 UTC)"
+    pd.testing.assert_frame_equal(pd.read_parquet(path), _cc.bars_up_to(bars, until))
+
+
+def test_save_bars_warns_and_writes_nothing_on_failure(tmp_path, capsys):
+    until = pd.Timestamp("2026-09-28 19:20:47", tz="UTC")
+    path = tmp_path / "spy_1m.parquet"
+    cases = [
+        (None, "the bar request failed"),
+        (_yahoo_bars([766.6], _ny(*MON, 15, 25)), "no bars up to the fetch time"),  # starts after the fetch
+        (_yahoo_bars([766.6], _ny(*MON, 15, 18)).drop(columns="Close"), "Close"),  # a malformed frame
+    ]
+    for bars, reason in cases:
+        note = _cc._save_bars(bars, until, path)
+        assert note.startswith("not saved") and reason in note
+        assert reason in capsys.readouterr().err
+        assert not path.exists()
+
+
+def _run_main(tmp_path, monkeypatch, bar_frames):
+    """Run main() against a fake Ticker, writing into tmp_path/data/raw."""
+    raw = tmp_path / "data" / "raw"
+    monkeypatch.setattr(_cc, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(_cc, "RAW_DIR", raw)
+    monkeypatch.setattr(_cc, "is_market_hours", lambda: True)
+    monkeypatch.setattr(_cc.yf, "Ticker", lambda ticker: _FakeTicker(bar_frames))
+    monkeypatch.setattr(_cc.time, "sleep", lambda seconds: None)
+    _cc.main()
+    return raw
+
+
+def test_main_saves_bars_under_the_chain_timestamp(tmp_path, monkeypatch, capsys):
+    end_bars = _yahoo_bars([701.25, 701.5], _ny(*MON, 15, 19))  # before the fetch, so both are kept
+    raw = _run_main(tmp_path, monkeypatch, [_bars([701.0], _ny(*MON, 15, 19)), end_bars])
+    chains = sorted(raw.glob("spy_chain_*.parquet"))
+    bar_files = sorted(raw.glob("spy_1m_*.parquet"))
+    assert len(chains) == len(bar_files) == 1
+    assert bar_files[0].name == chains[0].name.replace("spy_chain_", "spy_1m_")
+    until = pd.read_parquet(chains[0])["fetch_utc"].max()
+    pd.testing.assert_frame_equal(pd.read_parquet(bar_files[0]), _cc.bars_up_to(end_bars, until))
+    assert f"Bars       : {bar_files[0].name} (2 bars" in capsys.readouterr().out
+
+
+def test_main_keeps_the_chain_when_the_bar_request_fails(tmp_path, monkeypatch, capsys):
+    raw = _run_main(tmp_path, monkeypatch, [_bars([701.0], _ny(*MON, 15, 19)), RuntimeError("no bars")])
+    assert len(list(raw.glob("spy_chain_*.parquet"))) == 1
+    assert not list(raw.glob("spy_1m_*.parquet"))
+    captured = capsys.readouterr()
+    assert "1-minute bars not saved: the bar request failed" in captured.err
+    assert "Bars       : not saved: the bar request failed" in captured.out
