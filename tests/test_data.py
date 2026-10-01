@@ -185,6 +185,7 @@ MONTHLIES = [
 # October monthly beyond 1 year: none is selected.
 NOT_SELECTED = ["2026-10-02", "2026-10-15", "2026-10-23", "2026-11-30", "2026-12-31", "2027-03-31", "2027-10-15"]
 SPOT, RATE, CARRY = 500.0, 0.04, 0.012
+S_BAR = 501.0  # spot at the quote time: between the strikes 500 and 502.5, below every F
 STRIKES = np.arange(450.0, 550.1, 2.5)
 
 
@@ -306,7 +307,7 @@ def test_parity_residuals():
 
 
 def test_clean_chain_synthetic_snapshot():
-    chain = clean_chain(_synthetic_snapshot(), RATE)
+    chain = clean_chain(_synthetic_snapshot(), RATE, S_BAR)
     assert [str(e.date()) for e in chain["expiry"].unique()] == MONTHLIES
 
     summary = chain_summary(chain)
@@ -320,12 +321,20 @@ def test_clean_chain_synthetic_snapshot():
     assert (summary["pairs"] == 10).all() and (summary["pairs_upper"] == 10).all()
     assert (summary["within"] == 1).all() and (summary["within_upper"] == 1).all()
 
-    # Every quote passes the filters, so only the in-the-money side is removed.
-    itm = [(STRIKES < f).sum() + (STRIKES >= f).sum() for f in F]  # calls below F, puts at or above it
-    assert summary["in_the_money"].tolist() == itm
+    # Every quote passes the filters, so only the in-the-money side is removed, against S_bar.
+    itm = (STRIKES < S_BAR).sum() + (STRIKES >= S_BAR).sum()  # calls below S_bar, puts at or above it
+    assert (summary["in_the_money"] == itm).all()
     assert (summary["kept"] == 2 * STRIKES.size - summary["in_the_money"]).all()
+    assert (summary["kept_puts"] == (STRIKES < S_BAR).sum()).all()
     kept = chain[chain["status"] == "kept"]
-    assert (kept["strike"] < kept["F"]).eq(kept["option_type"] == "put").all()
+    assert (kept["strike"] < S_BAR).eq(kept["option_type"] == "put").all()
+    # Between S_bar and F the call is kept and the put, in the money against the spot, is not.
+    between = (chain["strike"] >= S_BAR) & (chain["strike"] < chain["F"])
+    with_between = [e for e, f in zip(MONTHLIES, F) if f > STRIKES[STRIKES >= S_BAR][0]]  # F above 502.5
+    assert [str(e.date()) for e in chain.loc[between, "expiry"].unique()] == with_between
+    assert len(with_between) >= 8
+    assert (chain.loc[between & (chain["option_type"] == "call"), "status"] == "kept").all()
+    assert (chain.loc[between & (chain["option_type"] == "put"), "status"] == "in the money").all()
     np.testing.assert_allclose(chain["k"], np.log(chain["strike"] / chain["F"]), rtol=0, atol=0)
     np.testing.assert_allclose(chain["mid"], (chain["bid"] + chain["ask"]) / 2, rtol=0, atol=0)
 
@@ -348,16 +357,15 @@ def test_filter_quotes_counts():
     raw.loc[zero_bid | wide, "openInterest"] = 0  # second failures, never counted
     raw.loc[wide, "ask"] = 2 * raw.loc[wide, "bid"]  # relative spread 2/3
     raw.loc[thin, "openInterest"] = 9
-    row = chain_summary(clean_chain(raw, RATE)).loc["2026-11-20"]
-    F = SPOT * np.exp((RATE - CARRY) * time_to_expiry("2026-11-20", FETCH))
-    itm = (STRIKES < F).sum() + (STRIKES >= F).sum()
+    row = chain_summary(clean_chain(raw, RATE, S_BAR)).loc["2026-11-20"]
+    itm = (STRIKES < S_BAR).sum() + (STRIKES >= S_BAR).sum()
     counts = [row[c] for c in ["zero_bid", "spread", "open_interest", "in_the_money", "kept"]]
     assert counts == [6, 6, 3, itm, 2 * STRIKES.size - 15 - itm]
-    assert row["kept_puts"] == (STRIKES < F).sum() - 9 and row["kept_calls"] == (STRIKES >= F).sum() - 6
+    assert row["kept_puts"] == (STRIKES < S_BAR).sum() - 9 and row["kept_calls"] == (STRIKES >= S_BAR).sum() - 6
 
 
 def test_chain_summary_counts_no_iv():
-    chain = clean_chain(_synthetic_snapshot(), RATE)
+    chain = clean_chain(_synthetic_snapshot(), RATE, S_BAR)
     before = chain_summary(chain)
     assert (before["no_IV"] == 0).all()  # a cleaned chain never holds the label
 
@@ -379,10 +387,13 @@ def test_chain_summary_counts_no_iv():
 def test_clean_chain_rejects_bad_snapshots():
     coarse = _synthetic_snapshot(strikes=np.arange(400.0, 600.1, 10.0))  # 480, 490, 500 in the fit band
     with pytest.raises(ValueError, match="2026-10-16: 3 valid pairs"):
-        clean_chain(coarse, RATE)
+        clean_chain(coarse, RATE, S_BAR)
     raw = _synthetic_snapshot()
     with pytest.raises(ValueError, match="repeats"):
-        clean_chain(pd.concat([raw, raw.iloc[:1]], ignore_index=True), RATE)
+        clean_chain(pd.concat([raw, raw.iloc[:1]], ignore_index=True), RATE, S_BAR)
+    for spot in (np.nan, np.inf, 0.0, -S_BAR):
+        with pytest.raises(ValueError, match="finite positive spot"):
+            clean_chain(raw, RATE, spot)
 
 
 def test_load_chain_builds_and_reads_frozen(tmp_path, monkeypatch):
@@ -397,9 +408,11 @@ def test_load_chain_builds_and_reads_frozen(tmp_path, monkeypatch):
         raise RuntimeError("network call made by load_chain")
 
     monkeypatch.setattr(yfinance, "download", _raise)
+    monkeypatch.setattr(yfinance, "Ticker", _no_network)
     (frozen / "manifest.json").write_text(json.dumps({"tickers": ["SPY"], "row_count": 3}))
     snapshot = raw_dir / "spy_chain_20260930T192047Z.parquet"
     _synthetic_snapshot().to_parquet(snapshot)
+    bars = _frozen_session_bars(frozen)
 
     chain = load_chain(snapshot.name)  # a bare name is looked up in data/raw/
     assert (frozen / "chain_20260930.parquet").exists()
@@ -412,6 +425,20 @@ def test_load_chain_builds_and_reads_frozen(tmp_path, monkeypatch):
     assert entry["expiries"] == MONTHLIES and entry["row_count"] == len(chain)
     assert entry["raw_rows"] == len(MONTHLIES + NOT_SELECTED) * 2 * STRIKES.size
     assert entry["kept"] == (chain["status"] == "kept").sum()
+
+    # The out-of-the-money boundary is the bar nearest the quote time, recorded with the entry. Every
+    # synthetic trade is at FETCH, so that is the 19:20 bar, which is also the bar nearest the fetch.
+    bar = nearest_bar_close(bars, FETCH)
+    assert entry["spot_bar"] == {
+        "close": bar["close"],
+        "bar_start": "2026-09-30T19:20:00+00:00",
+        "bar_end": "2026-09-30T19:21:00+00:00",
+        "target_utc": FETCH.isoformat(),
+        "bars": "spy_1m_20260930.parquet",
+    }
+    assert entry["spot_bar_fetch"] == entry["spot_bar"]
+    assert SPOT < bar["close"] < chain["F"].max()  # a boundary distinct from the spot quote and from F
+    pd.testing.assert_frame_equal(chain, clean_chain(_synthetic_snapshot(), rate, bar["close"]))
 
     snapshot.unlink()  # the frozen file is read without the raw snapshot
     pd.testing.assert_frame_equal(load_chain(snapshot), chain)
@@ -426,22 +453,26 @@ def test_frozen_chain_integrity(history):
     assert monthly_expiries(summary.index).all()
     assert (summary["pairs"] >= 6).all()
     assert set(chain["status"]) <= {"kept", "zero bid", "spread", "open interest", "in the money"}
+    spot_bar = json.loads(FROZEN_MANIFEST.read_text())["chains"][FROZEN_CHAIN.name]["spot_bar"]["close"]
     kept = chain[chain["status"] == "kept"]
-    assert (kept["strike"] < kept["F"]).eq(kept["option_type"] == "put").all()
+    assert (kept["strike"] < spot_bar).eq(kept["option_type"] == "put").all()  # out of the money against S_bar
+    passed = chain["status"].isin(["kept", "in the money"])  # every quote filter passed
+    otm = np.where(chain["option_type"] == "call", chain["strike"] >= spot_bar, chain["strike"] < spot_bar)
+    assert (chain.loc[passed, "status"] == np.where(otm[passed], "kept", "in the money")).all()
     assert (filter_quotes(kept["bid"], kept["ask"], kept["openInterest"]) == "kept").all()
     np.testing.assert_allclose(chain["k"], np.log(chain["strike"] / chain["F"]), rtol=0, atol=0)
     np.testing.assert_allclose(chain["D"], np.exp(-chain["rate"] * chain["T"]), rtol=0, atol=0)
     assert (chain["rate"] == history.loc["2026-09-29", "r"]).all()
 
-    # Cleaning the frozen quotes again reproduces the frozen table exactly.
+    # Cleaning the frozen quotes again at the manifest's S_bar reproduces the frozen table exactly.
     raw = chain[RAW_COLUMNS].assign(expiry=chain["expiry"].dt.strftime("%Y-%m-%d"))
-    pd.testing.assert_frame_equal(clean_chain(raw, chain["rate"].iloc[0]), chain)
+    pd.testing.assert_frame_equal(clean_chain(raw, chain["rate"].iloc[0], spot_bar), chain)
 
 
 # SPY 1-minute bars: a mocked regular session of 2026-09-30, 13:30 to 19:59 UTC (09:30 to 15:59 in New York).
-def _session_bars(day="2026-09-30"):
+def _session_bars(day="2026-09-30", base=760.0):
     index = pd.date_range(f"{day} 09:30", f"{day} 15:59", freq="1min", tz="America/New_York")
-    close = 760.0 + 0.01 * np.arange(index.size)  # a distinct close per bar
+    close = base + 0.01 * np.arange(index.size)  # a distinct close per bar
     return pd.DataFrame(
         {"Open": close, "High": close, "Low": close, "Close": close, "Adj Close": close, "Volume": 1000,
          "Dividends": 0.0, "Stock Splits": 0.0, "Capital Gains": 0.0},
@@ -519,6 +550,15 @@ def test_load_minute_bars_rejects_bad_downloads(tmp_path, monkeypatch):
     assert not (tmp_path / "spy_1m_20260930.parquet").exists()
 
 
+def _frozen_session_bars(frozen):
+    """Freeze the mocked 2026-09-30 session as load_minute_bars stores it, closes near SPOT; returns the bars."""
+    bars = _session_bars(base=SPOT - 2.5)
+    bars.index = bars.index.tz_convert("UTC").rename("bar_start")
+    bars = bars[["Open", "High", "Low", "Close", "Volume"]]
+    bars.to_parquet(frozen / "spy_1m_20260930.parquet")
+    return bars
+
+
 def _spot_bar_setup(tmp_path, monkeypatch):
     """A frozen synthetic chain in a temporary data/ tree, with the day's bars frozen and the network blocked.
 
@@ -530,6 +570,7 @@ def _spot_bar_setup(tmp_path, monkeypatch):
     monkeypatch.setattr(volsurf.data, "_FROZEN", frozen)
     monkeypatch.setattr(volsurf.data, "_MANIFEST", frozen / "manifest.json")
     monkeypatch.setattr(volsurf.data, "_RAW", raw_dir)
+    monkeypatch.setattr(yfinance, "Ticker", _no_network)
     snapshot = raw_dir / "spy_chain_20260930T192047Z.parquet"
     with pytest.raises(ValueError, match="not in the manifest"):
         snapshot_spot_bar(snapshot)
@@ -540,12 +581,8 @@ def _spot_bar_setup(tmp_path, monkeypatch):
     raw.loc[raw["expiry"] == "2026-11-20", "lastTradeDate"] = pd.Timestamp("2026-09-30 19:05:42", tz="UTC")
     raw.loc[raw["expiry"] == "2026-10-02", "lastTradeDate"] = pd.Timestamp("2026-09-30 19:12", tz="UTC")
     raw.to_parquet(snapshot)
-    load_chain(snapshot.name)
-    bars = _session_bars()
-    bars.index = bars.index.tz_convert("UTC").rename("bar_start")
-    bars = bars[["Open", "High", "Low", "Close", "Volume"]]
-    bars.to_parquet(frozen / "spy_1m_20260930.parquet")
-    monkeypatch.setattr(yfinance, "Ticker", _no_network)
+    bars = _frozen_session_bars(frozen)
+    load_chain(snapshot.name)  # cleans at the close of the bar nearest 19:05:42
     return frozen, raw_dir, snapshot, bars
 
 
@@ -595,7 +632,7 @@ def test_snapshot_spot_bar_prefers_saved_bars(tmp_path, monkeypatch):
     assert _manifest_entry()["spot_bar"] == spots["spot_bar"]
 
     (frozen / "spy_1m_20260930.parquet").unlink()  # without either file, one download, which is frozen
-    fake = _FakeTicker(_session_bars())
+    fake = _FakeTicker(_session_bars(base=SPOT - 2.5))
     monkeypatch.setattr(yfinance, "Ticker", lambda ticker: fake)
     spots = snapshot_spot_bar(snapshot.name)
     assert len(fake.calls) == 1 and (frozen / "spy_1m_20260930.parquet").exists()
@@ -710,7 +747,7 @@ def test_clean_chain_with_rate_curve():
     def curve(T):
         return 0.035 + 0.006 * np.asarray(T)
 
-    chain = clean_chain(_synthetic_snapshot(rate=curve), curve)
+    chain = clean_chain(_synthetic_snapshot(rate=curve), curve, S_BAR)
     summary = chain_summary(chain)
     T = time_to_expiry(MONTHLIES, FETCH)
     np.testing.assert_allclose(summary["F"], SPOT * np.exp((curve(T) - CARRY) * T), rtol=0, atol=1e-8)
@@ -724,7 +761,7 @@ def test_chain_summary_one_sided_diagnostic():
     # Strikes 4 apart: 7 pairs from 476 to 500 lie in the fixed-D fit band, enough for the fit
     # (6) but not for the one-sided free-slope diagnostic (8) until the band widens with T.
     strikes = np.arange(400.0, 600.1, 4.0)
-    summary = chain_summary(clean_chain(_synthetic_snapshot(strikes=strikes), RATE))
+    summary = chain_summary(clean_chain(_synthetic_snapshot(strikes=strikes), RATE, S_BAR))
     T = summary["T_days"].to_numpy() / 365
     x = np.log(strikes / SPOT)
     expected = [int(((x >= -max(0.05, 0.1 * np.sqrt(t))) & (x <= 0)).sum()) for t in T]
@@ -739,7 +776,7 @@ def test_chain_summary_one_sided_diagnostic():
 
 
 def test_chain_summary_spot_sets_the_carry_only():
-    chain = clean_chain(_synthetic_snapshot(), RATE)
+    chain = clean_chain(_synthetic_snapshot(), RATE, S_BAR)
     default, moved = chain_summary(chain), chain_summary(chain, spot=505.0)
     pd.testing.assert_frame_equal(chain_summary(chain, spot=SPOT), default)  # SPOT is the snapshot's spot_start
     T = default["T_days"] / 365
@@ -757,7 +794,7 @@ def test_frozen_rate_choice(history):
     curve = pd.read_csv(FROZEN_CURVE, index_col="date", parse_dates=["date"])
     _, tenors, rates = treasury_rates(curve, "2026-09-30")
     raw = chain[RAW_COLUMNS].assign(expiry=chain["expiry"].dt.strftime("%Y-%m-%d"))
-    treasury = chain_summary(clean_chain(raw, lambda T: interp_rate(T, tenors, rates)), spot=spot_bar)
+    treasury = chain_summary(clean_chain(raw, lambda T: interp_rate(T, tenors, rates), spot_bar), spot=spot_bar)
     q = treasury.loc[treasury.index > "2026-12-18", "q"]
     assert len(q) == 9
     assert not q.between(0.008, 0.016).all()

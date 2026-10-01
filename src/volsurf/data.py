@@ -41,9 +41,10 @@ D      : discount factor exp(-rate·T)
 F      : parity forward of the expiry (fixed-D fit, see parity_forward)
 k      : log-moneyness ln(K/F)
 status : 'kept', or the first rule that removed the contract: 'zero bid',
-         'spread', 'open interest', 'in the money' (Stage 2c relabels kept
-         contracts without an implied vol 'no IV' in the notebook's copy;
-         the frozen file never holds that label)
+         'spread', 'open interest', 'in the money' (against S_bar, the spot
+         at the quote time: puts with K >= S_bar, calls with K < S_bar).
+         Stage 2c relabels kept contracts without an implied vol 'no IV' in
+         the notebook's copy; the frozen file never holds that label
 
 data/frozen/chain_YYYYMMDD.parquet stores this table, so Table 1 rebuilds
 from data/frozen/ alone. Snapshots collected after 2026-09-30 also carry
@@ -485,15 +486,26 @@ def _parity_pairs(rows):
     return pairs.index.to_numpy(dtype=float), *quotes
 
 
-def clean_chain(raw, rate):
+def _selected_expiries(raw):
+    """The expiries of a raw snapshot that select_expiries keeps, from each expiry's own fetch_utc."""
+    listed = raw.groupby("expiry")["fetch_utc"].first()
+    return listed.index[select_expiries(listed.index, time_to_expiry(listed.index, listed.to_numpy()))]
+
+
+def clean_chain(raw, rate, spot):
     """Select expiries, fit parity forwards and label every contract.
 
     Steps: T per expiry from its own fetch_utc; expiry selection
     (select_expiries); per expiry, D = exp(-r·T) and F from parity_forward
     with D fixed, over the valid pairs with -0.05 <= ln(K/S) <= 0, where S is
     spot_start; filter_quotes on every contract; then out-of-the-money
-    selection with F (puts with K < F and calls with K >= F are kept, the
-    others are labelled 'in the money'); k = ln(K/F).
+    selection at the spot of the quote time S_bar (puts with K < S_bar and
+    calls with K >= S_bar are kept, the others are labelled 'in the money');
+    k = ln(K/F).
+
+    The boundary is S_bar, not F: a put with S_bar <= K < F is in the money
+    against the spot, so its American early-exercise premium inflates its
+    implied vol, and the call at the same strike is out of the money.
 
     Parameters
     ----------
@@ -506,6 +518,10 @@ def clean_chain(raw, rate):
         Continuously compounded rate r as a decimal, used for every expiry;
         or a function of T (years, ndarray) that returns each expiry's rate
         r(T), such as a Treasury curve through interp_rate.
+    spot : float
+        S_bar, the spot at the quote time in currency units (the close of the
+        SPY 1-minute bar nearest the latest option trade, as recorded by
+        snapshot_spot_bar): the boundary of the out-of-the-money selection.
 
     Returns
     -------
@@ -518,8 +534,9 @@ def clean_chain(raw, rate):
     ValueError
         On duplicate (expiry, option_type, strike) rows, an unknown
         option_type, more than one fetch_utc per expiry or more than one
-        spot, a selection outside 8 to 12 slices, or an expiry with fewer
-        than 6 valid pairs in the fit band.
+        spot_start, a spot that is not finite and positive, a selection
+        outside 8 to 12 slices, or an expiry with fewer than 6 valid pairs in
+        the fit band.
     """
     if raw.duplicated(["expiry", "option_type", "strike"]).any():
         raise ValueError("the snapshot repeats an (expiry, option_type, strike) row")
@@ -529,11 +546,11 @@ def clean_chain(raw, rate):
         raise ValueError("each expiry needs a single fetch_utc")
     if raw["spot_start"].nunique() != 1:
         raise ValueError("the snapshot needs a single spot_start")
-    spot = float(raw["spot_start"].iloc[0])
+    if not (np.isfinite(spot) and spot > 0):
+        raise ValueError(f"the out-of-the-money boundary needs a finite positive spot, not {spot}")
+    band_spot = float(raw["spot_start"].iloc[0])
 
-    listed = raw.groupby("expiry")["fetch_utc"].first()
-    selected = listed.index[select_expiries(listed.index, time_to_expiry(listed.index, listed.to_numpy()))]
-    chain = raw[raw["expiry"].isin(selected)].copy()
+    chain = raw[raw["expiry"].isin(_selected_expiries(raw))].copy()
     chain["expiry"] = pd.to_datetime(chain["expiry"])
     chain = chain.sort_values(["expiry", "option_type", "strike"], ignore_index=True)
 
@@ -544,7 +561,7 @@ def clean_chain(raw, rate):
     forwards = {}
     for expiry, rows in chain.groupby("expiry"):
         K, *quotes = _parity_pairs(rows)
-        x = np.log(K / spot)
+        x = np.log(K / band_spot)
         band = (x >= -_BAND) & (x <= 0)
         if band.sum() < _MIN_PAIRS:
             raise ValueError(
@@ -557,7 +574,7 @@ def clean_chain(raw, rate):
 
     status = filter_quotes(chain["bid"], chain["ask"], chain["openInterest"])
     is_call = (chain["option_type"] == "call").to_numpy()
-    in_the_money = np.where(is_call, chain["strike"] < chain["F"], chain["strike"] >= chain["F"])
+    in_the_money = np.where(is_call, chain["strike"] < spot, chain["strike"] >= spot)
     chain["status"] = np.where((status == "kept") & in_the_money, "in the money", status)
     return chain
 
@@ -680,9 +697,14 @@ def load_chain(snapshot, refresh=False):
     snapshot's file name. When it exists and refresh is False it is read and
     the raw snapshot is not needed. Otherwise the raw snapshot is cleaned
     with clean_chain at the rate of the last ^IRX close strictly before the
-    snapshot's New York date (from load_history), written to the frozen
-    file, and recorded under "chains" in data/frozen/manifest.json. Nothing
-    is downloaded.
+    snapshot's New York date (from load_history) and at S_bar, the spot at
+    the quote time: the close of the SPY 1-minute bar nearest the latest
+    option trade of the selected expiries. The bars come from the sources
+    snapshot_spot_bar reads (the bars saved with the pull, then the frozen
+    day file), and the day is downloaded only when neither exists. The chain
+    is written to the frozen file and recorded under "chains" in
+    data/frozen/manifest.json, with the spot_bar and spot_bar_fetch entries
+    that snapshot_spot_bar returns.
 
     Parameters
     ----------
@@ -716,7 +738,10 @@ def load_chain(snapshot, refresh=False):
     first, last = raw["fetch_utc"].min(), raw["fetch_utc"].max()
     snapshot_date = first.tz_convert(_NY).normalize().tz_localize(None)
     rate, rate_date = _snapshot_rate(load_history()["r"], snapshot_date)
-    chain = clean_chain(raw, rate)
+    quote_time = raw.loc[raw["expiry"].isin(_selected_expiries(raw)), "lastTradeDate"].max()
+    bars, bars_name = _snapshot_bars(path, snapshot_date)
+    spots = _spot_entries(bars, bars_name, quote_time, first)
+    chain = clean_chain(raw, rate, spots["spot_bar"]["close"])
 
     _FROZEN.mkdir(parents=True, exist_ok=True)
     chain.to_parquet(frozen)
@@ -734,6 +759,7 @@ def load_chain(snapshot, refresh=False):
         "raw_rows": len(raw),
         "row_count": len(chain),
         "kept": int((chain["status"] == "kept").sum()),
+        **spots,
     }}})
     return chain
 
@@ -836,6 +862,37 @@ def load_minute_bars(date, refresh=False):
     return bars
 
 
+def _snapshot_bars(path, day, refresh=False):
+    """The 1-minute bars of a raw snapshot and the name of the file they come from.
+
+    The bars saved with the pull (spy_1m_YYYYMMDDTHHMMSSZ.parquet next to the
+    snapshot path) when they exist, else load_minute_bars(day, refresh),
+    which reads data/frozen/spy_1m_YYYYMMDD.parquet and downloads the day
+    only when that file is missing or refresh is True.
+    """
+    saved = path.with_name(path.name.replace("spy_chain_", "spy_1m_", 1))
+    if saved.exists():
+        return pd.read_parquet(saved), saved.name
+    return load_minute_bars(day, refresh=refresh), f"spy_1m_{day:%Y%m%d}.parquet"
+
+
+def _spot_entries(bars, bars_name, quote_time, fetch_first):
+    """The spot_bar (nearest quote_time) and spot_bar_fetch (nearest fetch_first) manifest entries."""
+
+    def _entry(when):
+        when = pd.Timestamp(when).tz_convert("UTC")
+        bar = nearest_bar_close(bars, when)
+        return {
+            "close": bar["close"],
+            "bar_start": bar["bar_start"].isoformat(),
+            "bar_end": bar["bar_end"].isoformat(),
+            "target_utc": when.isoformat(),
+            "bars": bars_name,
+        }
+
+    return {"spot_bar": _entry(quote_time), "spot_bar_fetch": _entry(fetch_first)}
+
+
 def snapshot_spot_bar(snapshot, refresh=False):
     """Spot of a chain snapshot from SPY 1-minute bars, recorded in its manifest entry.
 
@@ -843,10 +900,11 @@ def snapshot_spot_bar(snapshot, refresh=False):
     matched to the spot at the latest option trade in the cleaned chain (the
     quote time), not at the fetch. Two bar closes are taken with
     nearest_bar_close: spot_bar, nearest the quote time, which Table 1's carry
-    uses, and spot_bar_fetch, nearest the snapshot's first fetch
-    (fetch_utc_first in the manifest). Both are written to the chain's entry
-    in data/frozen/manifest.json only when they are missing or different, so
-    a plain read leaves the manifest unchanged.
+    and the out-of-the-money selection of clean_chain use, and spot_bar_fetch,
+    nearest the snapshot's first fetch (fetch_utc_first in the manifest).
+    load_chain records both when it builds the chain; here they are written
+    to the chain's entry in data/frozen/manifest.json only when they are
+    missing or different, so a plain read leaves the manifest unchanged.
 
     The bars come from the first source that exists: the bars saved with the
     pull, spy_1m_YYYYMMDDTHHMMSSZ.parquet next to the snapshot (under the
@@ -891,26 +949,10 @@ def snapshot_spot_bar(snapshot, refresh=False):
         raise ValueError(f"{name} is not in the manifest; build it with load_chain first")
 
     chain = load_chain(snapshot)
-    quote_time = pd.Timestamp(chain["lastTradeDate"].max()).tz_convert("UTC")
-    fetch_first = pd.Timestamp(entry["fetch_utc_first"]).tz_convert("UTC")
+    fetch_first = pd.Timestamp(entry["fetch_utc_first"])
     day = fetch_first.tz_convert(_NY).normalize().tz_localize(None)
-    saved = path.with_name(path.name.replace("spy_chain_", "spy_1m_", 1))
-    if saved.exists():
-        bars, bars_name = pd.read_parquet(saved), saved.name
-    else:
-        bars, bars_name = load_minute_bars(day, refresh=refresh), f"spy_1m_{day:%Y%m%d}.parquet"
-
-    def _entry(when):
-        bar = nearest_bar_close(bars, when)
-        return {
-            "close": bar["close"],
-            "bar_start": bar["bar_start"].isoformat(),
-            "bar_end": bar["bar_end"].isoformat(),
-            "target_utc": when.isoformat(),
-            "bars": bars_name,
-        }
-
-    spots = {"spot_bar": _entry(quote_time), "spot_bar_fetch": _entry(fetch_first)}
+    bars, bars_name = _snapshot_bars(path, day, refresh=refresh)
+    spots = _spot_entries(bars, bars_name, chain["lastTradeDate"].max(), fetch_first)
     if any(entry.get(key) != value for key, value in spots.items()):
         _update_manifest({"chains": {name: {**entry, **spots}}})
     return spots

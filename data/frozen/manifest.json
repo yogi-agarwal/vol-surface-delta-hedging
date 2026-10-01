@@ -15,7 +15,7 @@
   },
   "chains": {
     "chain_20260930.parquet": {
-      "utc_timestamp": "2026-10-01T03:08:29.160667+00:00",
+      "utc_timestamp": "2026-10-01T20:04:31.073478+00:00",
       "snapshot": "spy_chain_20260930T192047Z.parquet",
       "ticker": "SPY",
       "yfinance_version": "1.7.0",
@@ -40,7 +40,7 @@
       ],
       "raw_rows": 9815,
       "row_count": 4625,
-      "kept": 2245,
+      "kept": 2247,
       "spot_bar": {
         "close": 766.7000122070312,
         "bar_start": "2026-09-30T19:05:00+00:00",
