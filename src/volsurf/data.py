@@ -24,11 +24,33 @@ Index     : DatetimeIndex of OptionMetrics dates, named date, tz-naive
 
 The OptionMetrics files are licensed WRDS extracts kept in data/raw/
 (gitignored). They are read locally only, never downloaded or committed.
+
+Chain columns (as returned by clean_chain and load_chain)
+---------------------------------------------------------
+Every contract of the selected expiries, one row each, with the raw snapshot
+columns (contractSymbol, strike, bid, ask, lastPrice, volume, openInterest,
+lastTradeDate, option_type 'call' or 'put', fetch_utc, spot_start, spot_end)
+and
+expiry : expiry date, tz-naive midnight
+mid    : (bid + ask)/2
+T      : years from the expiry's fetch_utc to 16:00 America/New_York on the
+         expiry date, ACT/365
+rate   : flat continuously compounded rate used for every expiry
+D      : discount factor exp(-rate·T)
+F      : parity forward of the expiry (fixed-D fit, see parity_forward)
+k      : log-moneyness ln(K/F)
+status : 'kept', or the first rule that removed the contract: 'zero bid',
+         'spread', 'open interest', 'in the money'
+
+data/frozen/chain_YYYYMMDD.parquet stores this table, so Table 1 rebuilds
+from data/frozen/ alone.
 """
 
 import json
 import pathlib
+import re
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -40,6 +62,20 @@ _HISTORY = _FROZEN / "history.parquet"
 _MANIFEST = _FROZEN / "manifest.json"
 _START = "2021-06-01"
 _BILL_DAYS = 91  # ^IRX quotes the 13-week (91-day) bill
+
+_NY = ZoneInfo("America/New_York")
+_YEAR_SECONDS = 365 * 86400  # ACT/365
+_EXPIRY_HOUR = 16  # options expire at the 16:00 New York close
+_MIN_T_DAYS = 7
+_SLICES = (8, 12)  # allowed number of selected expiries
+_LONG_MONTHS = (1, 3, 6, 9, 12)  # LEAPS (January) and quarterly months kept beyond 1 year
+_BAND = 0.05  # |ln(K/S)| band of the parity fits
+_MIN_PAIRS = 6  # fixed-D forward fit, -0.05 <= ln(K/S) <= 0
+_MIN_PAIRS_FREE = 8  # free-slope diagnostic, |ln(K/S)| <= 0.05
+_MAX_SPREAD = 0.25  # largest (ask - bid)/mid kept
+_MIN_OPEN_INTEREST = 10
+_RATE_MAX_AGE_DAYS = 5  # the ^IRX close may precede the snapshot by at most this many days
+_SNAPSHOT_NAME = re.compile(r"spy_chain_(\d{8})T\d{6}Z\.parquet")
 
 _RAW = _REPO / "data" / "raw"
 _OM_STD = "om_spy_std_30d_2021_2025.csv"  # standardised options, 30-day ATM-forward
@@ -132,7 +168,7 @@ def load_history(refresh: bool = False) -> pd.DataFrame:
         _FROZEN.mkdir(parents=True, exist_ok=True)
         df.to_parquet(_HISTORY)
 
-        manifest = {
+        _update_manifest({
             "utc_timestamp": datetime.now(timezone.utc).isoformat(),
             "tickers": ["SPY", "^VIX", "^IRX"],
             "yfinance_version": yfinance.__version__,
@@ -140,11 +176,26 @@ def load_history(refresh: bool = False) -> pd.DataFrame:
             "end_date": str(df.index[-1].date()),
             "row_count": len(df),
             "ffill_counts": ffill_counts,
-        }
-        _MANIFEST.write_text(json.dumps(manifest, indent=2))
+        })
 
     df["r"] = irx_to_rate(df["r"])
     return df
+
+
+def _update_manifest(entries):
+    """Merge *entries* into data/frozen/manifest.json, keeping every other key.
+
+    A dict value merges one level deep into an existing dict under the same
+    key (so a new chain entry joins the earlier ones); any other value
+    replaces the old one.
+    """
+    manifest = json.loads(_MANIFEST.read_text()) if _MANIFEST.exists() else {}
+    for key, value in entries.items():
+        if isinstance(value, dict) and isinstance(manifest.get(key), dict):
+            manifest[key] = {**manifest[key], **value}
+        else:
+            manifest[key] = value
+    _MANIFEST.write_text(json.dumps(manifest, indent=2))
 
 
 def load_optionmetrics(raw_dir=None):
@@ -199,3 +250,435 @@ def load_optionmetrics(raw_dir=None):
     out = pd.concat(columns, axis=1).sort_index()
     out.index.name = "date"
     return out
+
+
+def monthly_expiries(expiries):
+    """Flag the monthly expiry of each month among the listed expiries.
+
+    The monthly expiry is the third Friday of the month, or the Thursday
+    before it when that Friday is not listed (an exchange holiday, such as
+    Good Friday or Juneteenth observed).
+
+    Parameters
+    ----------
+    expiries : array_like of date-like
+        Every listed expiry date of the snapshot (str 'YYYY-MM-DD' or
+        timestamps; any time of day is ignored).
+
+    Returns
+    -------
+    ndarray of bool
+        True where the expiry is its month's monthly expiry.
+    """
+    dates = pd.DatetimeIndex(pd.to_datetime(np.atleast_1d(expiries))).normalize()
+    first = dates.to_period("M").to_timestamp()
+    third_friday = first + pd.to_timedelta((4 - first.weekday.to_numpy()) % 7 + 14, unit="D")
+    holiday_thursday = (dates == third_friday - pd.Timedelta(days=1)) & ~third_friday.isin(dates)
+    return np.asarray((dates == third_friday) | holiday_thursday)
+
+
+def time_to_expiry(expiry, fetch_utc):
+    """Time from a fetch timestamp to the 16:00 New York close on the expiry date.
+
+    Parameters
+    ----------
+    expiry : date-like or array_like of date-like
+        Expiry dates (any time of day is ignored).
+    fetch_utc : datetime-like or array_like of datetime-like
+        Fetch timestamps, tz-aware (tz-naive values are read as UTC).
+        Broadcasts against expiry.
+
+    Returns
+    -------
+    float or ndarray
+        T in years, (expiry 16:00 America/New_York - fetch_utc)/365 days,
+        with daylight saving handled by the time zone. A float when both
+        inputs are scalars.
+    """
+    close = pd.DatetimeIndex(pd.to_datetime(np.atleast_1d(expiry))).normalize()
+    close = (close + pd.Timedelta(hours=_EXPIRY_HOUR)).tz_localize(_NY)
+    fetch = pd.DatetimeIndex(pd.to_datetime(np.atleast_1d(fetch_utc), utc=True))
+    seconds = (close.as_unit("ns").asi8 - fetch.as_unit("ns").asi8) / 1e9
+    T = seconds / _YEAR_SECONDS
+    return float(T[0]) if np.ndim(expiry) == 0 and np.ndim(fetch_utc) == 0 else T
+
+
+def select_expiries(expiry, T):
+    """Select the expiry slices of the surface.
+
+    Keeps the monthly expiries (see monthly_expiries) with 7 days <= T <= 1
+    year, and beyond 1 year the quarterly (March, June, September, December)
+    and LEAPS (January) monthlies.
+
+    Parameters
+    ----------
+    expiry : array_like of date-like
+        Every listed expiry date of the snapshot, each once.
+    T : array_like of float
+        Time to each expiry in years (time_to_expiry), same shape.
+
+    Returns
+    -------
+    ndarray of bool
+        True for the selected expiries.
+
+    Raises
+    ------
+    ValueError
+        If the selection does not give 8 to 12 slices.
+    """
+    T = np.asarray(T, dtype=float)
+    month = pd.DatetimeIndex(pd.to_datetime(np.atleast_1d(expiry))).month.to_numpy()
+    keep = monthly_expiries(expiry) & (T >= _MIN_T_DAYS / 365) & ((T <= 1.0) | np.isin(month, _LONG_MONTHS))
+    lo, hi = _SLICES
+    if not lo <= keep.sum() <= hi:
+        raise ValueError(f"expiry selection gives {keep.sum()} slices; {lo} to {hi} are required")
+    return keep
+
+
+def _quote_arrays(K, call_bid, call_ask, put_bid, put_ask):
+    """Float arrays of one expiry's pairs: K, C_mid - P_mid and the two half-spreads."""
+    K, cb, ca, pb, pa = (np.asarray(x, dtype=float) for x in (K, call_bid, call_ask, put_bid, put_ask))
+    return K, (cb + ca) / 2 - (pb + pa) / 2, (ca - cb) / 2, (pa - pb) / 2
+
+
+def parity_forward(K, call_bid, call_ask, put_bid, put_ask, D=None):
+    """Forward and discount factor from put-call parity on one expiry's pairs.
+
+    Parity for European options gives C - P = D·(F - K). Mids are fitted by
+    weighted least squares with weights 1/(h_C² + h_P²), where h is a
+    quote's half-spread (ask - bid)/2.
+
+    Parameters
+    ----------
+    K : array_like
+        Strikes of the call-put pairs.
+    call_bid, call_ask, put_bid, put_ask : array_like
+        Quotes at each strike; every ask must exceed its bid.
+    D : float, optional
+        Known discount factor to expiry. If given, the slope is held at -D
+        and F = Σ w·(K + (C_mid - P_mid)/D) / Σ w in closed form. If None,
+        the slope is free: D = -slope and F = intercept/D.
+
+    Returns
+    -------
+    F, D : float
+        Forward price (currency units of K) and discount factor.
+
+    Raises
+    ------
+    ValueError
+        If there are fewer than 2 pairs or a half-spread is not positive.
+    """
+    K, y, h_call, h_put = _quote_arrays(K, call_bid, call_ask, put_bid, put_ask)
+    if K.size < 2:
+        raise ValueError(f"parity fit needs at least 2 pairs, got {K.size}")
+    if not (np.all(h_call > 0) and np.all(h_put > 0)):
+        raise ValueError("every quote in a parity fit needs ask > bid")
+    w = 1 / (h_call**2 + h_put**2)
+    if D is not None:
+        return float(np.sum(w * (K + y / D)) / np.sum(w)), float(D)
+    K_bar = np.sum(w * K) / np.sum(w)  # centring the regressor keeps the fit well conditioned
+    sw = np.sqrt(w)
+    (level, slope), *_ = np.linalg.lstsq(np.column_stack([sw, sw * (K - K_bar)]), sw * y, rcond=None)
+    D = -slope  # y = D·(F - K_bar) - D·(K - K_bar)
+    return float(K_bar + level / D), float(D)
+
+
+def parity_residuals(K, call_bid, call_ask, put_bid, put_ask, F, D):
+    """Parity residuals of one expiry's pairs and their combined half-spreads.
+
+    Parameters
+    ----------
+    K, call_bid, call_ask, put_bid, put_ask : array_like
+        Strikes and quotes of the call-put pairs.
+    F, D : float
+        Forward and discount factor of the expiry.
+
+    Returns
+    -------
+    residual : ndarray
+        (C_mid - P_mid) - D·(F - K), in the currency units of K.
+    half_spread : ndarray
+        h_C + h_P, the half-width of the synthetic C - P market, which runs
+        from C_bid - P_ask to C_ask - P_bid. Parity holds within the market
+        where |residual| <= half_spread.
+    """
+    K, y, h_call, h_put = _quote_arrays(K, call_bid, call_ask, put_bid, put_ask)
+    return y - D * (F - K), h_call + h_put
+
+
+def filter_quotes(bid, ask, open_interest):
+    """Apply the quote filters in order and label each contract.
+
+    Rules, in order: zero bid (bid not above 0); spread, (ask - bid)/mid
+    above 0.25; open interest below 10. A contract is labelled with the
+    first rule it fails.
+
+    Parameters
+    ----------
+    bid, ask : array_like
+        Quotes in currency units.
+    open_interest : array_like
+        Open interest in contracts.
+
+    Returns
+    -------
+    ndarray of str
+        'kept', 'zero bid', 'spread' or 'open interest' per contract.
+    """
+    bid, ask, oi = (np.asarray(x, dtype=float) for x in (bid, ask, open_interest))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        wide = ~((ask - bid) / ((bid + ask) / 2) <= _MAX_SPREAD)  # a missing ask counts as wide
+    rules = [~(bid > 0), wide, ~(oi >= _MIN_OPEN_INTEREST)]
+    return np.select(rules, ["zero bid", "spread", "open interest"], default="kept")
+
+
+def _parity_pairs(rows):
+    """Valid call-put pairs of one expiry, sorted by strike.
+
+    A pair is valid when both the call and the put have bid > 0 and
+    ask > bid. Returns the arrays (K, call_bid, call_ask, put_bid, put_ask).
+    """
+    calls = rows[rows["option_type"] == "call"].set_index("strike")[["bid", "ask"]]
+    puts = rows[rows["option_type"] == "put"].set_index("strike")[["bid", "ask"]]
+    pairs = calls.join(puts, how="inner", lsuffix="_c", rsuffix="_p").sort_index()
+    valid = (
+        (pairs["bid_c"] > 0) & (pairs["ask_c"] > pairs["bid_c"])
+        & (pairs["bid_p"] > 0) & (pairs["ask_p"] > pairs["bid_p"])
+    )
+    pairs = pairs[valid]
+    quotes = [pairs[c].to_numpy(dtype=float) for c in ["bid_c", "ask_c", "bid_p", "ask_p"]]
+    return pairs.index.to_numpy(dtype=float), *quotes
+
+
+def clean_chain(raw, rate):
+    """Select expiries, fit parity forwards and label every contract.
+
+    Steps: T per expiry from its own fetch_utc; expiry selection
+    (select_expiries); per expiry, D = exp(-rate·T) and F from parity_forward
+    with D fixed, over the valid pairs with -0.05 <= ln(K/S) <= 0, where S is
+    spot_start; filter_quotes on every contract; then out-of-the-money
+    selection with F (puts with K < F and calls with K >= F are kept, the
+    others are labelled 'in the money'); k = ln(K/F).
+
+    Parameters
+    ----------
+    raw : pd.DataFrame
+        A chain snapshot as written by scripts/collect_chain.py: one row per
+        contract with strike, bid, ask, openInterest, expiry, option_type
+        ('call' or 'put'), fetch_utc (one per expiry) and spot_start (one
+        value), plus any other columns, which are carried through.
+    rate : float
+        Continuously compounded rate as a decimal, used for every expiry.
+
+    Returns
+    -------
+    pd.DataFrame
+        Every contract of the selected expiries, sorted by expiry, type and
+        strike, with the columns described in the module docstring.
+
+    Raises
+    ------
+    ValueError
+        On duplicate (expiry, option_type, strike) rows, an unknown
+        option_type, more than one fetch_utc per expiry or more than one
+        spot, a selection outside 8 to 12 slices, or an expiry with fewer
+        than 6 valid pairs in the fit band.
+    """
+    if raw.duplicated(["expiry", "option_type", "strike"]).any():
+        raise ValueError("the snapshot repeats an (expiry, option_type, strike) row")
+    if not raw["option_type"].isin(["call", "put"]).all():
+        raise ValueError("option_type must be 'call' or 'put'")
+    if raw.groupby("expiry")["fetch_utc"].nunique().max() > 1:
+        raise ValueError("each expiry needs a single fetch_utc")
+    if raw["spot_start"].nunique() != 1:
+        raise ValueError("the snapshot needs a single spot_start")
+    spot = float(raw["spot_start"].iloc[0])
+
+    listed = raw.groupby("expiry")["fetch_utc"].first()
+    selected = listed.index[select_expiries(listed.index, time_to_expiry(listed.index, listed.to_numpy()))]
+    chain = raw[raw["expiry"].isin(selected)].copy()
+    chain["expiry"] = pd.to_datetime(chain["expiry"])
+    chain = chain.sort_values(["expiry", "option_type", "strike"], ignore_index=True)
+
+    chain["mid"] = (chain["bid"] + chain["ask"]) / 2
+    chain["T"] = time_to_expiry(chain["expiry"], chain["fetch_utc"])
+    chain["rate"] = rate
+    chain["D"] = np.exp(-rate * chain["T"])
+    forwards = {}
+    for expiry, rows in chain.groupby("expiry"):
+        K, *quotes = _parity_pairs(rows)
+        x = np.log(K / spot)
+        band = (x >= -_BAND) & (x <= 0)
+        if band.sum() < _MIN_PAIRS:
+            raise ValueError(
+                f"expiry {expiry.date()}: {band.sum()} valid pairs with {-_BAND} <= ln(K/S) <= 0, "
+                f"at least {_MIN_PAIRS} required"
+            )
+        forwards[expiry], _ = parity_forward(K[band], *(q[band] for q in quotes), D=rows["D"].iloc[0])
+    chain["F"] = chain["expiry"].map(forwards)
+    chain["k"] = np.log(chain["strike"] / chain["F"])
+
+    status = filter_quotes(chain["bid"], chain["ask"], chain["openInterest"])
+    is_call = (chain["option_type"] == "call").to_numpy()
+    in_the_money = np.where(is_call, chain["strike"] < chain["F"], chain["strike"] >= chain["F"])
+    chain["status"] = np.where((status == "kept") & in_the_money, "in the money", status)
+    return chain
+
+
+def chain_summary(chain):
+    """Table 1 per expiry, computed from a cleaned chain alone.
+
+    Parameters
+    ----------
+    chain : pd.DataFrame
+        Output of clean_chain or load_chain.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per expiry (index expiry) with
+        T_days : T in calendar days
+        contracts : contracts of the expiry in the snapshot
+        zero_bid, spread, open_interest, in_the_money : removals per rule
+        kept_puts, kept_calls, kept : contracts kept
+        K_min, K_max : strike range of the kept contracts
+        pairs, pairs_upper : valid pairs with -0.05 <= ln(K/S) <= 0 (the fit)
+            and with 0 < ln(K/S) <= 0.05 (excluded from the fit)
+        F, D : forward and discount factor used downstream
+        q : implied carry rate - ln(F/S)/T, as a decimal
+        within, within_upper : share of those pairs whose parity residual
+            lies within the combined half-spread (NaN without pairs)
+        F_free, D_free, r_free : free-slope parity fit over |ln(K/S)| <= 0.05
+            and its implied rate -ln(D_free)/T (NaN with fewer than 8 pairs);
+            a diagnostic only
+    """
+    spot = float(chain["spot_start"].iloc[0])
+    rules = ["zero bid", "spread", "open interest", "in the money"]
+    rows = []
+    for expiry, g in chain.groupby("expiry"):
+        T, F, D, rate = (float(g[c].iloc[0]) for c in ["T", "F", "D", "rate"])
+        kept = g[g["status"] == "kept"]
+        removed = g["status"].value_counts()
+        K, *quotes = _parity_pairs(g)
+        x = np.log(K / spot)
+        fit, upper, both = (x >= -_BAND) & (x <= 0), (x > 0) & (x <= _BAND), np.abs(x) <= _BAND
+        residual, half_spread = parity_residuals(K, *quotes, F, D)
+        within = np.abs(residual) <= half_spread
+        F_free, D_free = np.nan, np.nan
+        if both.sum() >= _MIN_PAIRS_FREE:
+            F_free, D_free = parity_forward(K[both], *(q[both] for q in quotes))
+        rows.append({
+            "expiry": expiry,
+            "T_days": 365 * T,
+            "contracts": len(g),
+            **{rule.replace(" ", "_"): int(removed.get(rule, 0)) for rule in rules},
+            "kept_puts": int((kept["option_type"] == "put").sum()),
+            "kept_calls": int((kept["option_type"] == "call").sum()),
+            "kept": len(kept),
+            "K_min": kept["strike"].min(),
+            "K_max": kept["strike"].max(),
+            "pairs": int(fit.sum()),
+            "pairs_upper": int(upper.sum()),
+            "F": F,
+            "D": D,
+            "q": rate - np.log(F / spot) / T,
+            "within": within[fit].mean() if fit.any() else np.nan,
+            "within_upper": within[upper].mean() if upper.any() else np.nan,
+            "F_free": F_free,
+            "D_free": D_free,
+            "r_free": -np.log(D_free) / T,
+        })
+    return pd.DataFrame(rows).set_index("expiry")
+
+
+def _snapshot_rate(r, snapshot_date):
+    """Last rate strictly before the snapshot date, and its date.
+
+    Parameters
+    ----------
+    r : pd.Series
+        Continuously compounded rates on a DatetimeIndex (load_history()['r']).
+    snapshot_date : pd.Timestamp
+        Snapshot date in New York, tz-naive midnight.
+
+    Returns
+    -------
+    rate : float
+    rate_date : pd.Timestamp
+
+    Raises
+    ------
+    ValueError
+        If no rate precedes the snapshot date by at most 5 calendar days.
+    """
+    before = r[r.index < snapshot_date]
+    if before.empty or (snapshot_date - before.index[-1]).days > _RATE_MAX_AGE_DAYS:
+        raise ValueError(f"no ^IRX close within {_RATE_MAX_AGE_DAYS} days before {snapshot_date.date()}")
+    return float(before.iloc[-1]), before.index[-1]
+
+
+def load_chain(snapshot, refresh=False):
+    """Load a cleaned chain from data/frozen/, building it from its raw snapshot if needed.
+
+    The frozen file is data/frozen/chain_YYYYMMDD.parquet, dated by the
+    snapshot's file name. When it exists and refresh is False it is read and
+    the raw snapshot is not needed. Otherwise the raw snapshot is cleaned
+    with clean_chain at the rate of the last ^IRX close strictly before the
+    snapshot's New York date (from load_history), written to the frozen
+    file, and recorded under "chains" in data/frozen/manifest.json. Nothing
+    is downloaded.
+
+    Parameters
+    ----------
+    snapshot : str or pathlib.Path
+        Raw snapshot spy_chain_YYYYMMDDTHHMMSSZ.parquet, as a path or as a
+        bare file name in data/raw/.
+    refresh : bool
+        If True, rebuild the frozen file from the raw snapshot.
+
+    Returns
+    -------
+    pd.DataFrame
+        The cleaned chain (columns in the module docstring).
+
+    Raises
+    ------
+    ValueError
+        If the file name does not match spy_chain_YYYYMMDDTHHMMSSZ.parquet.
+    """
+    path = pathlib.Path(snapshot)
+    match = _SNAPSHOT_NAME.fullmatch(path.name)
+    if match is None:
+        raise ValueError(f"{path.name} is not a spy_chain_YYYYMMDDTHHMMSSZ.parquet snapshot")
+    if path.parent == pathlib.Path("."):
+        path = _RAW / path
+    frozen = _FROZEN / f"chain_{match.group(1)}.parquet"
+    if not refresh and frozen.exists():
+        return pd.read_parquet(frozen)
+
+    raw = pd.read_parquet(path)
+    first, last = raw["fetch_utc"].min(), raw["fetch_utc"].max()
+    snapshot_date = first.tz_convert(_NY).normalize().tz_localize(None)
+    rate, rate_date = _snapshot_rate(load_history()["r"], snapshot_date)
+    chain = clean_chain(raw, rate)
+
+    _FROZEN.mkdir(parents=True, exist_ok=True)
+    chain.to_parquet(frozen)
+    _update_manifest({"chains": {frozen.name: {
+        "utc_timestamp": datetime.now(timezone.utc).isoformat(),
+        "snapshot": path.name,
+        "ticker": "SPY",
+        "yfinance_version": yfinance.__version__,
+        "fetch_utc_first": first.isoformat(),
+        "fetch_utc_last": last.isoformat(),
+        "spot": float(raw["spot_start"].iloc[0]),
+        "rate": rate,
+        "rate_date": str(rate_date.date()),
+        "expiries": [str(e.date()) for e in chain["expiry"].unique()],
+        "raw_rows": len(raw),
+        "row_count": len(chain),
+        "kept": int((chain["status"] == "kept").sum()),
+    }}})
+    return chain
