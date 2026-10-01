@@ -102,13 +102,28 @@ Setup: GBM with σ_true = σ_i = 0.18, r = q = 0, S0 = 100, K = F0, T = 21/252, 
 - Price predictor: σ_i = 0.18 on GBM paths with σ_true = 0.27 and 0.12, drift and flat financing r = 0.04, K = F0, daily hedging, c = 0, 200,000 paths. Mean P&L/(C0·G0) equals P_price at the true vol, BS(σ_true)/BS(σ_i) - 1 = 0.499789 and -0.333292 (exact), within ±0.003 (verified 0.4978 and -0.3330; the tolerance is 0.6% and 0.9% of the exact values, about 4 and 8 standard errors). P_gap at the true vol overstates the first and understates the second by the factor (σ_true + σ_i)/(2σ_i), 1.25 and 0.83.
 
 ## 5. Chain cleaning (Stage 2b)
-- T = (expiry at 16:00 America/New_York - snapshot timestamp)/365 days, using the full datetime.
-- Expiry selection: third-Friday monthlies out to 1 year plus quarterly and LEAPS expiries beyond; 8 to 12 slices; drop T < 7 days.
-- Forwards from parity, per expiry, before any OTM filtering: strikes with valid call and put quotes and |ln(K/S)| ≤ 0.05 (at least 8 pairs); weighted least squares of (C_mid - P_mid) on K with weights 1/(h_C² + h_P²), h = half-spread. D = -slope, F = intercept/D. Implied r = -ln(D)/T; implied carry q = r - ln(F/S)/T. Tabulate per expiry (expect near-zero dividend carry for expiries before the mid-December ex-date).
-- Parity diagnostic: residuals against the combined half-spread; report the share within.
-- Filters in order, counting removals: zero bid; (ask - bid)/mid > 0.25; open interest < 10. The no-IV filter is applied in Stage 2c.
-- OTM selection with the fitted F: puts with K < F, calls with K ≥ F. k = ln(K/F), w = σ²T.
-- Test: a synthetic chain built from known F and D recovers both to 1e-8.
+- T = (expiry at 16:00 America/New_York - fetch timestamp)/365 days, using the full datetime and each expiry's own fetch_utc.
+- Expiry selection: a month's monthly expiry is its third Friday, or the Thursday before it when that Friday is not listed (an exchange holiday: June 2027 expires on Thursday 17 June because Juneteenth is observed on Friday 18 June). Keep the monthlies with 7 days ≤ T ≤ 1 year, and beyond 1 year the quarterly (March, June, September, December) and LEAPS (January) monthlies. The selection must give 8 to 12 slices; anything else raises.
+- Valid pairs: strikes where both the call and the put have bid > 0 and ask > bid, so both half-spreads h = (ask - bid)/2 are positive. S is the snapshot's spot quote (spot_start).
+- Discount factor: D = exp(-r·T), with r = irx_to_rate of the last ^IRX close strictly before the snapshot date (2026-09-29 for the 2026-09-30 snapshot), one flat rate for every expiry.
+- Forward from parity, per expiry, before any filtering: weighted least squares of (C_mid - P_mid) on K with the slope held at -D, over the valid pairs with -0.05 ≤ ln(K/S) ≤ 0 (at least 6 pairs), weights 1/(h_C² + h_P²). The fit has the closed form F = Σ w·(K + (C_mid - P_mid)/D) / Σ w. Implied carry q = r - ln(F/S)/T. Tabulate per expiry.
+- Why D is not fitted. The first design fitted D as minus the free slope over |ln(K/S)| ≤ 0.05. On the snapshot that gave D > 1 for every expiry out to September 2027 (D = 1.0079, implied r = -17.9% at 16 days). SPY options are American: an in-the-money put (K > S) carries an early-exercise premium that grows with K, which steepens C - P in K. A pre-build check, a no-dividend CRR tree at r = 4.14% with flat vol fitted the same way, gives the same sign and size (D = 1.0109, r = -24.7% at 16 days). On the one-sided band the put is out of the money and its premium is smallest. The same check with D fixed at its true value gives the relative F bias below; it is not asserted by a test, because binomial pricing is outside the build.
+
+  | T (days) | two-sided band | one-sided band |
+  |---|---|---|
+  | 16 | -0.034% | -0.003% |
+  | 51 | -0.069% | -0.021% |
+  | 107 | -0.130% | -0.061% |
+  | 352 | -0.428% | -0.298% |
+  | 842 | -1.091% | -0.878% |
+
+  The leftover bias comes from the out-of-the-money put premium. SPY's dividends cut the put premium and give the in-the-money calls (K < S) a premium of their own, pushing F the other way, so the check does not fix the sign of the real bias.
+- Free-slope diagnostic: the first design's fit, weighted least squares of (C_mid - P_mid) on K over the valid pairs with |ln(K/S)| ≤ 0.05 (at least 8 pairs, else NaN), D_free = -slope, F_free = intercept/D_free, r_free = -ln(D_free)/T. Reported in Table 1 only, never used downstream.
+- Parity diagnostic: residuals (C_mid - P_mid) - D·(F - K) against the combined half-spread h_C + h_P, the exact half-width of the synthetic C - P market (C_bid - P_ask to C_ask - P_bid). Report the share within on the fit pairs, and separately on the valid pairs with 0 < ln(K/S) ≤ 0.05, which the fit excludes and where the early-exercise premium shows.
+- Filters in order, after the forward fit, on every contract of the selected expiries, counting each removal under the first rule it fails: zero bid; (ask - bid)/mid > 0.25; open interest < 10. The no-IV filter is applied in Stage 2c.
+- OTM selection with the fitted F: puts with K < F, calls with K ≥ F; the others are counted as in the money. The kept set does not depend on the order of the rules, only the attribution of removals does. k = ln(K/F). Total variance w = σ²T is computed in Stage 2c, once implied vols exist.
+- Frozen table: data/frozen/chain_YYYYMMDD.parquet holds every contract of the selected expiries with its status (kept, or the rule that removed it), T, F, D, the rate and k, so Table 1 rebuilds from data/frozen/ alone.
+- Tests: on a synthetic European chain built from known F and D, the fixed-D fit recovers F to 1e-8 given D, and the free-slope fit recovers both F and D to 1e-8. Filter counts on a constructed chain; T from a fixed timestamp, across the end of daylight saving.
 
 ## 6. Implied vol (Stage 2c)
 - brentq on [0.001, 5.0] with xtol 1e-14, after checking for a sign change; otherwise return NaN and count the contract under "no IV" in Table 1.
@@ -154,6 +169,7 @@ Tables
 ## 10. Limitations to state in README
 - Overlapping windows are not independent: report the non-overlapping subsample and moving block bootstrap intervals.
 - SPY options are American; European pricing on OTM quotes leaves a small early-exercise bias, largest for long-dated puts.
+- The parity forwards come from American quotes. With D fixed from ^IRX and only pairs with K ≤ S, where the put is out of the money, the forward still carries a small early-exercise bias; a binomial de-Americanisation of the prices is the fix, left as an extension.
 - VIX is a variance-swap level and sits above ATM vol by the section 8 gap; the sensitivity bounds its effect.
 - The comparison crosses underlyings: VIX is an SPX variance-swap level, while the hedged underlying and the OptionMetrics ATM vol are SPY, so σ_i = VIX also carries any difference between SPX and SPY implied vol.
 - One snapshot: the surface describes a single moment.
