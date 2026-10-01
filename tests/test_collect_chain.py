@@ -1,4 +1,4 @@
-"""Tests for scripts/collect_chain.py: time guard and NTM zero-bid abort logic."""
+"""Tests for scripts/collect_chain.py: time guard, NTM zero-bid abort logic and the bar spot."""
 
 import importlib.util
 import pathlib
@@ -121,3 +121,75 @@ def test_empty_ntm_returns_zero():
     strikes = [spot * np.exp(k) for k in (-0.3, 0.3)]
     df = _make_df(strikes, [0.0, 0.0], spot)
     assert _ntm_zero_bid_share(df, spot) == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# 1-minute bar spot
+# ---------------------------------------------------------------------------
+
+def _bars(closes: list[float], first: datetime) -> pd.DataFrame:
+    """A mocked yfinance 1-minute bar frame, indexed by bar start in New York time."""
+    index = pd.date_range(first, periods=len(closes), freq="1min")
+    return pd.DataFrame({"Open": closes, "High": closes, "Low": closes, "Close": closes, "Volume": 100}, index=index)
+
+
+def test_latest_bar():
+    bars = _bars([766.5, 766.6, 766.57], _ny(*MON, 15, 18))
+    close, start = _cc.latest_bar(bars)
+    assert close == 766.57
+    assert start == pd.Timestamp("2026-09-28 19:20", tz="UTC")  # 15:20 New York (EDT)
+    assert str(start.tz) == "UTC"
+
+
+def test_latest_bar_empty():
+    close, start = _cc.latest_bar(_bars([], _ny(*MON, 15, 18)))
+    assert np.isnan(close) and start is pd.NaT
+
+
+class _FakeTicker:
+    """Stands in for yf.Ticker: one expiry, a constant quote and a new bar frame per history call."""
+
+    def __init__(self, bar_frames):
+        self.fast_info = {"last_price": 700.0}
+        self.options = ("2026-10-16",)
+        self._bar_frames = list(bar_frames)
+        self.history_calls = []
+
+    def option_chain(self, expiry):
+        side = pd.DataFrame({"contractSymbol": ["A"], "strike": [700.0], "bid": [1.0], "ask": [1.1]})
+        return type("Chain", (), {"calls": side, "puts": side.copy()})()
+
+    def history(self, **kwargs):
+        self.history_calls.append(kwargs)
+        frame = self._bar_frames.pop(0)
+        if isinstance(frame, Exception):
+            raise frame
+        return frame
+
+
+def test_fetch_chain_records_bar_spots(monkeypatch):
+    start_bars = _bars([701.0, 701.25], _ny(*MON, 15, 19))
+    end_bars = _bars([701.25, 701.5, 701.75], _ny(*MON, 15, 19))
+    fake = _FakeTicker([start_bars, end_bars])
+    monkeypatch.setattr(_cc.yf, "Ticker", lambda ticker: fake)
+    monkeypatch.setattr(_cc.time, "sleep", lambda seconds: None)
+
+    spot_start, spot_end, df = _cc._fetch_chain("SPY")
+    assert spot_start == spot_end == 700.0
+    assert (df["spot_start"] == 700.0).all() and (df["spot_end"] == 700.0).all()  # the quote is kept
+    assert (df["spot_bar_start"] == 701.25).all() and (df["spot_bar_end"] == 701.75).all()
+    assert (df["spot_bar_start_utc"] == pd.Timestamp("2026-09-28 19:20", tz="UTC")).all()
+    assert (df["spot_bar_end_utc"] == pd.Timestamp("2026-09-28 19:21", tz="UTC")).all()
+    assert len(fake.history_calls) == 2
+    assert all(call["period"] == "1d" and call["interval"] == "1m" for call in fake.history_calls)
+
+
+def test_fetch_chain_survives_a_failed_bar_request(monkeypatch):
+    fake = _FakeTicker([RuntimeError("no bars"), _bars([], _ny(*MON, 15, 19))])
+    monkeypatch.setattr(_cc.yf, "Ticker", lambda ticker: fake)
+    monkeypatch.setattr(_cc.time, "sleep", lambda seconds: None)
+
+    _, _, df = _cc._fetch_chain("SPY")
+    assert df["spot_bar_start"].isna().all() and df["spot_bar_end"].isna().all()
+    assert df["spot_bar_start_utc"].isna().all() and df["spot_bar_end_utc"].isna().all()
+    assert str(df["spot_bar_start_utc"].dtype) == "datetime64[ns, UTC]"
