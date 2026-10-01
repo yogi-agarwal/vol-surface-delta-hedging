@@ -35,7 +35,8 @@ expiry : expiry date, tz-naive midnight
 mid    : (bid + ask)/2
 T      : years from the expiry's fetch_utc to 16:00 America/New_York on the
          expiry date, ACT/365
-rate   : flat continuously compounded rate used for every expiry
+rate   : continuously compounded rate of the expiry (the flat ^IRX rate,
+         the same for every expiry, unless clean_chain is given a curve r(T))
 D      : discount factor exp(-rate·T)
 F      : parity forward of the expiry (fixed-D fit, see parity_forward)
 k      : log-moneyness ln(K/F)
@@ -57,6 +58,15 @@ Index                  : DatetimeIndex of bar starts in UTC, named bar_start
 
 data/frozen/spy_1m_YYYYMMDD.parquet stores one day's bars; snapshot_spot_bar
 matches them to a chain snapshot.
+
+Treasury curve (as returned by load_treasury_curve)
+---------------------------------------------------
+DGS1MO, DGS3MO, DGS6MO, DGS1, DGS2, DGS3 : FRED Treasury constant-maturity
+                                          yields in percent, as published
+Index                                    : DatetimeIndex of dates, named date
+
+data/frozen/ust_curve_YYYYMMDD.csv stores the 14 days up to a snapshot date;
+treasury_rates turns one date into continuously compounded rates.
 """
 
 import json
@@ -91,6 +101,9 @@ _RATE_MAX_AGE_DAYS = 5  # the ^IRX close may precede the snapshot by at most thi
 _SNAPSHOT_NAME = re.compile(r"spy_chain_(\d{8})T\d{6}Z\.parquet")
 _BAR = pd.Timedelta(minutes=1)  # Yahoo 1-minute bars, labelled by their opening minute
 _BAR_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
+_FRED_CSV = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+_UST_TENORS = {"DGS1MO": 1 / 12, "DGS3MO": 0.25, "DGS6MO": 0.5, "DGS1": 1.0, "DGS2": 2.0, "DGS3": 3.0}  # years
+_UST_WINDOW_DAYS = 14  # calendar days of the curve downloaded up to the snapshot date
 
 _RAW = _REPO / "data" / "raw"
 _OM_STD = "om_spy_std_30d_2021_2025.csv"  # standardised options, 30-day ATM-forward
@@ -471,7 +484,7 @@ def clean_chain(raw, rate):
     """Select expiries, fit parity forwards and label every contract.
 
     Steps: T per expiry from its own fetch_utc; expiry selection
-    (select_expiries); per expiry, D = exp(-rate·T) and F from parity_forward
+    (select_expiries); per expiry, D = exp(-r·T) and F from parity_forward
     with D fixed, over the valid pairs with -0.05 <= ln(K/S) <= 0, where S is
     spot_start; filter_quotes on every contract; then out-of-the-money
     selection with F (puts with K < F and calls with K >= F are kept, the
@@ -484,8 +497,10 @@ def clean_chain(raw, rate):
         contract with strike, bid, ask, openInterest, expiry, option_type
         ('call' or 'put'), fetch_utc (one per expiry) and spot_start (one
         value), plus any other columns, which are carried through.
-    rate : float
-        Continuously compounded rate as a decimal, used for every expiry.
+    rate : float or callable
+        Continuously compounded rate r as a decimal, used for every expiry;
+        or a function of T (years, ndarray) that returns each expiry's rate
+        r(T), such as a Treasury curve through interp_rate.
 
     Returns
     -------
@@ -519,8 +534,8 @@ def clean_chain(raw, rate):
 
     chain["mid"] = (chain["bid"] + chain["ask"]) / 2
     chain["T"] = time_to_expiry(chain["expiry"], chain["fetch_utc"])
-    chain["rate"] = rate
-    chain["D"] = np.exp(-rate * chain["T"])
+    chain["rate"] = rate(chain["T"].to_numpy()) if callable(rate) else rate
+    chain["D"] = np.exp(-chain["rate"] * chain["T"])
     forwards = {}
     for expiry, rows in chain.groupby("expiry"):
         K, *quotes = _parity_pairs(rows)
@@ -859,3 +874,140 @@ def snapshot_spot_bar(snapshot, refresh=False):
     if any(entry.get(key) != value for key, value in spots.items()):
         _update_manifest({"chains": {name: {**entry, **spots}}})
     return spots
+
+
+def cmt_to_rate(y):
+    """Continuously compounded rate from a Treasury constant-maturity yield.
+
+    CMT yields are bond-equivalent yields compounded semiannually, so
+    (1 + y/2)^(2T) = exp(r·T) gives r = 2·ln(1 + y/2) at every maturity.
+
+    Parameters
+    ----------
+    y : float, ndarray or pd.Series
+        Yield as a decimal (the FRED DGS value / 100).
+
+    Returns
+    -------
+    Same type as y
+        Rate r as a decimal, continuously compounded.
+    """
+    return 2 * np.log1p(y / 2)
+
+
+def interp_rate(T, tenors, rates):
+    """Rate at each maturity by linear interpolation in T.
+
+    Parameters
+    ----------
+    T : float or array_like
+        Maturities in years.
+    tenors : array_like
+        Curve maturities in years, increasing.
+    rates : array_like
+        Continuously compounded rates at the tenors, as decimals.
+
+    Returns
+    -------
+    float or ndarray
+        r(T), held flat at the end rates below the first tenor and above the
+        last one.
+    """
+    return np.interp(T, np.asarray(tenors, dtype=float), np.asarray(rates, dtype=float))
+
+
+def treasury_rates(curve, date):
+    """Treasury rates for a date from a CMT curve table.
+
+    Takes the latest date on or before *date* on which all six yields are
+    published and converts them with cmt_to_rate.
+
+    Parameters
+    ----------
+    curve : pd.DataFrame
+        Yields in percent on a DatetimeIndex of dates, one column per FRED
+        series (DGS1MO, DGS3MO, DGS6MO, DGS1, DGS2, DGS3), as returned by
+        load_treasury_curve.
+    date : date-like
+        The date the curve is for.
+
+    Returns
+    -------
+    curve_date : pd.Timestamp
+        The date used.
+    tenors : ndarray
+        Maturities in years: 1/12, 1/4, 1/2, 1, 2, 3.
+    rates : ndarray
+        Continuously compounded rates at those tenors, as decimals.
+
+    Raises
+    ------
+    ValueError
+        If no complete curve lies within 5 calendar days on or before *date*.
+    """
+    day = pd.Timestamp(date).normalize()
+    full = curve.loc[curve.index <= day, list(_UST_TENORS)].dropna()
+    if full.empty or (day - full.index[-1]).days > _RATE_MAX_AGE_DAYS:
+        raise ValueError(f"no complete Treasury curve within {_RATE_MAX_AGE_DAYS} days on or before {day.date()}")
+    tenors = np.array(list(_UST_TENORS.values()))
+    return full.index[-1], tenors, cmt_to_rate(full.iloc[-1].to_numpy(dtype=float) / 100)
+
+
+def _fred_series(series, start, end):
+    """One FRED series from *start* to *end* as floats in percent on a DatetimeIndex (network)."""
+    url = f"{_FRED_CSV}?id={series}&cosd={start:%Y-%m-%d}&coed={end:%Y-%m-%d}"
+    frame = pd.read_csv(url, na_values=".")
+    dates = pd.DatetimeIndex(pd.to_datetime(frame.iloc[:, 0]), name="date")
+    return pd.Series(frame[series].to_numpy(dtype=float), index=dates, name=series)
+
+
+def load_treasury_curve(date, refresh=False):
+    """Treasury constant-maturity yields around a date, read from data/frozen/ or downloaded.
+
+    The frozen file is data/frozen/ust_curve_YYYYMMDD.csv. It is downloaded
+    from FRED (no API key) only when it is missing or refresh is True, over
+    the 14 calendar days up to *date*, and recorded under "curves" in
+    data/frozen/manifest.json with the curve date treasury_rates selects.
+
+    Parameters
+    ----------
+    date : date-like
+        The date the curve is for (the chain snapshot date).
+    refresh : bool
+        If True, download again and overwrite the frozen file.
+
+    Returns
+    -------
+    pd.DataFrame
+        Yields in percent as published, one row per date (DatetimeIndex named
+        date) and one column per series: DGS1MO, DGS3MO, DGS6MO, DGS1, DGS2,
+        DGS3. Unpublished values are NaN.
+
+    Raises
+    ------
+    ValueError
+        If a download holds no complete curve within 5 days on or before
+        *date* (nothing is written then).
+    """
+    day = pd.Timestamp(date).normalize()
+    path = _FROZEN / f"ust_curve_{day:%Y%m%d}.csv"
+    if refresh or not path.exists():
+        start = day - pd.Timedelta(days=_UST_WINDOW_DAYS)
+        curve = pd.concat([_fred_series(s, start, day) for s in _UST_TENORS], axis=1).sort_index()
+        curve.index.name = "date"
+        curve_date, _, _ = treasury_rates(curve, day)
+
+        _FROZEN.mkdir(parents=True, exist_ok=True)
+        curve.to_csv(path)
+        _update_manifest({"curves": {path.name: {
+            "utc_timestamp": datetime.now(timezone.utc).isoformat(),
+            "source": "FRED, Treasury constant maturity, percent, bond-equivalent",
+            "url": _FRED_CSV,
+            "series": list(_UST_TENORS),
+            "tenors_years": list(_UST_TENORS.values()),
+            "start_date": str(start.date()),
+            "end_date": str(day.date()),
+            "row_count": len(curve),
+            "curve_date": str(curve_date.date()),
+        }}})
+    return pd.read_csv(path, index_col="date", parse_dates=["date"])

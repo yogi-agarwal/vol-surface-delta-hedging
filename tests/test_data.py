@@ -12,12 +12,15 @@ from volsurf.black_scholes import black76_price
 from volsurf.data import (
     chain_summary,
     clean_chain,
+    cmt_to_rate,
     filter_quotes,
+    interp_rate,
     irx_to_rate,
     load_chain,
     load_history,
     load_minute_bars,
     load_optionmetrics,
+    load_treasury_curve,
     monthly_expiries,
     nearest_bar_close,
     parity_forward,
@@ -25,12 +28,14 @@ from volsurf.data import (
     select_expiries,
     snapshot_spot_bar,
     time_to_expiry,
+    treasury_rates,
 )
 
 FROZEN_HISTORY = pathlib.Path(__file__).resolve().parents[1] / "data" / "frozen" / "history.parquet"
 FROZEN_CHAIN = FROZEN_HISTORY.with_name("chain_20260930.parquet")
 FROZEN_BARS = FROZEN_HISTORY.with_name("spy_1m_20260930.parquet")
 FROZEN_MANIFEST = FROZEN_HISTORY.with_name("manifest.json")
+FROZEN_CURVE = FROZEN_HISTORY.with_name("ust_curve_20260930.csv")
 RAW_COLUMNS = [  # columns written by scripts/collect_chain.py
     "contractSymbol", "strike", "bid", "ask", "lastPrice", "volume", "openInterest", "lastTradeDate",
     "expiry", "option_type", "fetch_utc", "spot_start", "spot_end",
@@ -188,12 +193,16 @@ def _smile(k):
     return 0.2 - 0.4 * k + 0.5 * k**2
 
 
-def _synthetic_snapshot(expiries=MONTHLIES + NOT_SELECTED, strikes=STRIKES):
-    """A raw snapshot with F = SPOT·exp((RATE - CARRY)·T) and D = exp(-RATE·T) per expiry."""
+def _synthetic_snapshot(expiries=MONTHLIES + NOT_SELECTED, strikes=STRIKES, rate=RATE):
+    """A raw snapshot with F = SPOT·exp((r - CARRY)·T) and D = exp(-r·T) per expiry.
+
+    rate is a float r, or a function giving r(T) per expiry.
+    """
     frames = []
     for expiry in expiries:
         T = time_to_expiry(expiry, FETCH)
-        F, D = SPOT * np.exp((RATE - CARRY) * T), np.exp(-RATE * T)
+        r = rate(T) if callable(rate) else rate
+        F, D = SPOT * np.exp((r - CARRY) * T), np.exp(-r * T)
         k = np.log(strikes / F)
         for option_type, is_call in (("call", True), ("put", False)):
             price = black76_price(F, strikes, T, D, _smile(k), is_call)
@@ -551,3 +560,114 @@ def test_frozen_spot_bars():
         assert entry[key]["close"] == bar["close"] and entry[key]["bar_start"] == bar["bar_start"].isoformat()
         assert entry[key]["target_utc"] == target.tz_convert("UTC").isoformat()
         assert abs(bar["bar_end"] - target) <= pd.Timedelta(seconds=30)
+
+
+UST_SERIES = ["DGS1MO", "DGS3MO", "DGS6MO", "DGS1", "DGS2", "DGS3"]
+UST_TENORS = np.array([1 / 12, 0.25, 0.5, 1.0, 2.0, 3.0])
+
+
+def _curve_frame(dates, yields):
+    """A CMT curve table in percent: one row of six yields per date."""
+    return pd.DataFrame(yields, index=pd.DatetimeIndex(pd.to_datetime(dates), name="date"), columns=UST_SERIES)
+
+
+def test_cmt_to_rate():
+    # Semiannual compounding: (1 + y/2)^(2T) equals exp(r·T) at every T.
+    y = np.array([0.0, 0.0404, 0.0498])
+    r = cmt_to_rate(y)
+    for T in (1 / 12, 1.0, 3.0):
+        np.testing.assert_allclose(np.exp(r * T), (1 + y / 2) ** (2 * T), rtol=1e-14)
+    assert cmt_to_rate(0.04) == pytest.approx(0.0396052546, abs=1e-9)  # 2·ln(1.02)
+    assert isinstance(cmt_to_rate(pd.Series([0.04])), pd.Series)
+
+
+def test_interp_rate():
+    rates = np.array([0.040, 0.042, 0.043, 0.045, 0.048, 0.049])
+    assert interp_rate(0.25, UST_TENORS, rates) == pytest.approx(0.042, abs=1e-15)
+    assert interp_rate(1.5, UST_TENORS, rates) == pytest.approx(0.0465, abs=1e-15)  # halfway from 1 to 2 years
+    assert interp_rate(16 / 365, UST_TENORS, rates) == 0.040  # flat below 1 month
+    assert interp_rate(5.0, UST_TENORS, rates) == 0.049  # flat beyond 3 years
+    np.testing.assert_allclose(interp_rate(np.array([0.5, 0.75]), UST_TENORS, rates), [0.043, 0.044], atol=1e-15)
+
+
+def test_treasury_rates():
+    yields = [
+        [4.01, 4.24, 4.34, 4.51, 4.87, 4.99],
+        [4.04, 4.25, 4.36, 4.58, 4.89, 4.98],
+        [4.05, 4.26, np.nan, 4.60, 4.90, 5.00],  # 2026-09-30 is not fully published
+    ]
+    curve = _curve_frame(["2026-09-28", "2026-09-29", "2026-09-30"], yields)
+    curve_date, tenors, rates = treasury_rates(curve, "2026-09-30")
+    assert curve_date == pd.Timestamp("2026-09-29")  # the latest complete date
+    np.testing.assert_allclose(tenors, UST_TENORS, rtol=0, atol=0)
+    np.testing.assert_allclose(rates, cmt_to_rate(np.array(yields[1]) / 100), rtol=0, atol=0)
+    assert treasury_rates(curve, "2026-09-28")[0] == pd.Timestamp("2026-09-28")  # on or before the date
+    with pytest.raises(ValueError, match="no complete Treasury curve"):
+        treasury_rates(curve, "2026-10-05")  # 6 days after the last complete curve
+    with pytest.raises(ValueError, match="no complete Treasury curve"):
+        treasury_rates(curve, "2026-09-27")
+
+
+def test_load_treasury_curve_download_and_frozen_read(tmp_path, monkeypatch):
+    monkeypatch.setattr(volsurf.data, "_FROZEN", tmp_path)
+    monkeypatch.setattr(volsurf.data, "_MANIFEST", tmp_path / "manifest.json")
+    (tmp_path / "manifest.json").write_text(json.dumps({"tickers": ["SPY"]}))
+    dates = pd.DatetimeIndex(["2026-09-28", "2026-09-29"], name="date")
+    calls = []
+
+    def _fake_series(series, start, end):
+        calls.append((series, start, end))
+        values = [4.0 + UST_SERIES.index(series) / 10, np.nan if series == "DGS3" else 4.1]
+        return pd.Series(values, index=dates, name=series)
+
+    monkeypatch.setattr(volsurf.data, "_fred_series", _fake_series)
+    curve = load_treasury_curve("2026-09-30")
+    assert [c[0] for c in calls] == UST_SERIES
+    assert all(c[1] == pd.Timestamp("2026-09-16") and c[2] == pd.Timestamp("2026-09-30") for c in calls)
+    assert curve.columns.tolist() == UST_SERIES and curve.index.name == "date"
+    assert np.isnan(curve.loc["2026-09-29", "DGS3"]) and curve.loc["2026-09-28", "DGS3"] == 4.5
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    entry = manifest["curves"]["ust_curve_20260930.csv"]
+    assert manifest["tickers"] == ["SPY"]
+    assert entry["curve_date"] == "2026-09-28" and entry["series"] == UST_SERIES and entry["row_count"] == 2
+    assert entry["start_date"] == "2026-09-16" and entry["end_date"] == "2026-09-30"
+
+    def _raise(*args):
+        raise RuntimeError("network call made by load_treasury_curve")
+
+    monkeypatch.setattr(volsurf.data, "_fred_series", _raise)
+    pd.testing.assert_frame_equal(load_treasury_curve(pd.Timestamp("2026-09-30")), curve)  # the frozen file
+
+    # A download without a recent complete curve raises and writes nothing.
+    stale = pd.DatetimeIndex(["2026-09-01"], name="date")
+    monkeypatch.setattr(volsurf.data, "_fred_series", lambda s, start, end: pd.Series([4.0], index=stale, name=s))
+    with pytest.raises(ValueError, match="no complete Treasury curve"):
+        load_treasury_curve("2026-09-30", refresh=True)
+    pd.testing.assert_frame_equal(load_treasury_curve("2026-09-30"), curve)
+
+
+def test_clean_chain_with_rate_curve():
+    # A rising term structure: clean_chain given r(T) recovers F and D = exp(-r(T)·T) on every expiry.
+    def curve(T):
+        return 0.035 + 0.006 * np.asarray(T)
+
+    chain = clean_chain(_synthetic_snapshot(rate=curve), curve)
+    summary = chain_summary(chain)
+    T = time_to_expiry(MONTHLIES, FETCH)
+    np.testing.assert_allclose(summary["F"], SPOT * np.exp((curve(T) - CARRY) * T), rtol=0, atol=1e-8)
+    np.testing.assert_allclose(summary["D"], np.exp(-curve(T) * T), rtol=0, atol=1e-15)
+    np.testing.assert_allclose(summary["q"], CARRY, rtol=0, atol=1e-10)
+    np.testing.assert_allclose(chain["rate"], curve(chain["T"]), rtol=0, atol=0)
+    assert chain.groupby("expiry")["rate"].nunique().eq(1).all()
+
+
+def test_frozen_treasury_curve():
+    curve = pd.read_csv(FROZEN_CURVE, index_col="date", parse_dates=["date"])
+    entry = json.loads(FROZEN_MANIFEST.read_text())["curves"][FROZEN_CURVE.name]
+    assert curve.columns.tolist() == UST_SERIES and len(curve) == entry["row_count"]
+    assert curve.index.is_unique and curve.index.is_monotonic_increasing
+    assert curve.index.max() <= pd.Timestamp("2026-09-30")
+    curve_date, tenors, rates = treasury_rates(curve, "2026-09-30")
+    assert str(curve_date.date()) == entry["curve_date"]
+    np.testing.assert_allclose(tenors, UST_TENORS, rtol=0, atol=0)
+    assert ((rates > 0) & (rates < 0.1)).all()

@@ -69,5 +69,32 @@
       "last_bar": "2026-09-30T19:59:00+00:00",
       "row_count": 390
     }
+  },
+  "curves": {
+    "ust_curve_20260930.csv": {
+      "utc_timestamp": "2026-10-01T04:04:20.532061+00:00",
+      "source": "FRED, Treasury constant maturity, percent, bond-equivalent",
+      "url": "https://fred.stlouisfed.org/graph/fredgraph.csv",
+      "series": [
+        "DGS1MO",
+        "DGS3MO",
+        "DGS6MO",
+        "DGS1",
+        "DGS2",
+        "DGS3"
+      ],
+      "tenors_years": [
+        0.08333333333333333,
+        0.25,
+        0.5,
+        1.0,
+        2.0,
+        3.0
+      ],
+      "start_date": "2026-09-16",
+      "end_date": "2026-09-30",
+      "row_count": 10,
+      "curve_date": "2026-09-29"
+    }
   }
 }
