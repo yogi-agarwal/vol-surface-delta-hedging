@@ -138,12 +138,25 @@ Setup: GBM with σ_true = σ_i = 0.18, r = q = 0, S0 = 100, K = F0, T = 21/252, 
 
 ## 7. SVI (Stage 3)
 - Raw SVI: w(k) = a + b·(ρ·(k - m) + √((k - m)² + s²)).
-- Constraints: b ≥ 0; |ρ| < 1; s > 0; a + b·s·√(1 - ρ²) ≥ 0 (so w ≥ 0); b·(1 + |ρ|) ≤ 2 (Lee's moment bound).
+- Constraints: b ≥ 0; |ρ| ≤ 1; s > 0; a + b·s·√(1 - ρ²) ≥ 0 (so w ≥ 0); b·(1 + |ρ|) ≤ 2 (Lee's moment bound).
+- Why |ρ| ≤ 1, not |ρ| < 1 (decision 2026-10-01). The inner set |d| ≤ c below is closed, so a fit can reach ρ = ±1, the limit in which one wing of w is flat; w stays ≥ 0 and Lee's bound still holds there. Fits with |ρ| within 1e-8 of 1 are flagged in Table 2.
 - Calibration (Zeliade quasi-explicit): for fixed (m, s), with y = (k - m)/s, w = a + d·y + c·√(y² + 1), where c = b·s and d = ρ·b·s. Inner problem: weighted least squares in (a, c, d) subject to c ≥ 0, |d| ≤ c, c + |d| ≤ 2s, and a + √(c² - d²) ≥ 0 (a convex set; solve with SLSQP). Outer problem: minimise over (m, s) with Nelder-Mead from a small grid of starts.
 - Weights: vega-weighted residuals in total variance, normalised per slice.
 - Cross-check: a direct 5-parameter L-BFGS-B fit from 20 random starts must not beat the quasi-explicit objective by more than 1e-10.
 - Fit error in vol points: RMSE over |k| ≤ √w_ATM (near the money) and over all points. Target: near the money under 1 vol point on every slice.
 - Test: a noiseless synthetic slice is recovered to 1e-8 in w.
+
+Implementation (decisions 2026-10-01)
+- Data: each expiry's kept quotes with an implied vol (Stage 2c), at k = ln(K/F) with w = σ²T.
+- Weights and objective: ω_i = the Black-76 vega of quote i at its market implied vol (with the expiry's F, D and T) over the slice's sum of vegas. The objective is f = Σ ω_i·(w(k_i) - w_i)², in total variance squared.
+- Inner problem: the closed-form weighted least squares solution first. f is strictly convex in (a, c, d) and the constraint set is convex, so when that solution satisfies every constraint it is the minimiser. Otherwise SLSQP, with analytic gradients, from the feasible start (max(min w, 0), s/2, 0), on f/Σ ω·w² in the variables (a, c, d)/v with v = Σ ω·w, ftol 1e-15. The solution is moved onto the constraint set (a correction of the order of SLSQP's constraint tolerance).
+- SLSQP gets the w_min constraint in the equivalent cone form c ≥ √(d² + min(a, 0)²). With |d| ≤ c, a + √(c² - d²) ≥ 0 holds for every a ≥ 0, and for a < 0 it reads c² - d² ≥ a², so the two forms describe the same set. The gradient of √(c² - d²) is infinite where |d| = c, which made SLSQP's linearised constraints incompatible, while the cone form's gradient is bounded. A run that reports failure restarts from its own point, for at most three runs. At a trial (m, s) of the outer search whose solve still fails, the search uses the feasible point SLSQP returned (an upper bound on the inner minimum); the solve at the reported (m, s) must converge or the fit raises.
+- Outer problem: Nelder-Mead over m in [k_min, k_max], the slice's quoted range, and s ≥ 1e-4, with xatol 1e-10 and fatol 1e-16 on f/Σ ω·w². Nine starts: m0 in {-1, 0, 1}·h, clipped into the range, and s0 in {0.5, 1, 2}·h, where h = √(Σ ω·w) is close to the ATM total vol because vega weights peak at the money. The best of the nine is kept.
+- Why m is bounded to the quoted range (decision 2026-10-01). The vertex is identified only inside the quoted range. An unbounded m extrapolates the unquoted call wing at up to Lee's slope of 2, which would distort Stage 4's calendar checks and the variance-swap integral. Table 2 flags every slice where m sits on its bound, within 1e-8 of k_min or k_max.
+- Direct cross-check: L-BFGS-B over the box variables (α, β, ρ, m, s), with b = 2β/(1 + |ρ|) and a = α - b·s·√(1 - ρ²). The box α ≥ 0, 0 ≤ β ≤ 1, -1 ≤ ρ ≤ 1, k_min ≤ m ≤ k_max, s ≥ 1e-4 is then exactly the constraint set above: α is the minimum of w and β the share of Lee's bound used. The gradient is analytic, with ftol 1e-16 and gtol 1e-14. The 20 starts come from np.random.default_rng(20261002), five uniforms per start in the order α, β, ρ, m, s: α on [0, max w], β on [0, 1], ρ on [-1, 1], m on [k_min, k_max] and ln s on [ln 0.001, ln 2].
+- Tolerances: the cross-check's 1e-10 is absolute on f. The shortest slice's f can itself be of that order, so the notebook also prints the gap relative to f. The constraints are asserted to 1e-12 after the conversion b = c/s, ρ = d/c from the inner parameters, and s > 0 strictly.
+- Fit error: the error of a quote is 100·(√(w_fit/T) - σ_mkt) vol points, and the RMSEs are unweighted. Near the money means |k| ≤ √w_ATM, with w_ATM the market w at k = 0, linear in k between the neighbouring quotes, so that the band does not depend on the fit it measures.
+- Tests: on synthetic slices, the inner problem equals the closed form where that is feasible; where Lee's bound binds, no point of a random feasible sample does better than it. The noiseless slice is recovered to 1e-8 in w; a slice that breaks Lee's bound fits with b·(1 + |ρ|) ≤ 2, active; a slice whose vertex lies beyond the quotes fits with m on its bound. The cross-check holds on a noisy slice and on the Lee-broken slice. A frozen-data test fits the twelve 2026-09-30 slices and asserts the constraints, the m range, the cross-check and the near-the-money target on every slice.
 
 ## 8. Arbitrage checks and bridge (Stage 4)
 - Butterfly: g(k) = (1 - k·w'/(2w))² - (w'²/4)·(1/w + 1/4) + w''/2 ≥ 0 on a fine grid k in [-2.0, 1.0] (6,001 points). Density p(k) = g(k)/√(2πw)·exp(-d_-²/2), with d_- = -k/√w - √w/2.
@@ -152,6 +165,7 @@ Setup: GBM with σ_true = σ_i = 0.18, r = q = 0, S0 = 100, K = F0, T = 21/252, 
 - Constrained refit, shortest expiry first: add g(k_j) ≥ 0 and w_i(k_j) ≥ w_{i-1}(k_j) on a 201-point grid; report violations on the fine grid before and after (Table 3).
 - Figure 3: linear interpolation of w in T at fixed k (this preserves calendar ordering). README must state that butterfly-freeness is certified on the fitted slices; between slices only Gatheral-Jacquier price interpolation guarantees it.
 - Bridge: build a 30-day slice by linear interpolation of w in T at fixed k between the bracketing expiries. Variance-swap total variance by replication, 2·∫ OTM(K)/K² dK in forward terms, cross-checked with Gatheral's ∫ φ(z)·w(k(z)) dz where z = -k/√w - √w/2. Test slice (verified): 14.9647% by both methods against ATM 13.6770%. For the snapshot day report the variance-swap vol, ATM vol, their gap, and the ^VIX close; feed the gap into the Stage 5 sensitivity.
+- Integration range (decision 2026-10-01): compute the variance-swap bridge over the quoted strike range of each slice, as the VIX methodology does, rather than over the extrapolated wings. Report the extrapolated-wing version only as a sensitivity. The fitted wings beyond the quotes are not identified by the data (section 7).
 
 ## 9. Figures and tables
 Figures
@@ -167,7 +181,7 @@ Figures
 
 Tables
 1. Data summary: expiries, strike ranges, contracts kept, removals per filter, and implied F, D, r and carry per expiry. Table 1b: rates, forwards, parity shares and carry under the flat ^IRX rate and the Treasury curve, side by side.
-2. SVI parameters per expiry with near-the-money and overall fit errors in vol points.
+2. SVI parameters per expiry with near-the-money and overall fit errors in vol points, flagging slices with m on its bound or |ρ| = 1.
 3. Butterfly and calendar violations per expiry, before and after constraints.
 4. Hedging summary by h and c: mean, std, RMSE, the R² ladder with slopes, plus the robustness and sensitivity rows. Table 4d is the Stage 5c sensitivity: σ_i = OptionMetrics ATM vol against σ_i = VIX on the same windows.
 
