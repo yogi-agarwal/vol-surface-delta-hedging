@@ -334,16 +334,45 @@ def _bound_flags(m, rho, k_lo, k_hi):
     return bool(min(abs(m - k_lo), abs(m - k_hi)) <= M_BOUND_TOL), bool(1.0 - abs(rho) <= RHO_BOUND_TOL)
 
 
+def _outer_starts(k, w, weights):
+    """outer_starts on validated arrays."""
+    h = np.sqrt(weights @ w)
+    k_lo, k_hi = float(k.min()), float(k.max())
+    return [(min(max(m0 * h, k_lo), k_hi), max(s0 * h, S_MIN)) for m0 in _START_M for s0 in _START_S]
+
+
+def outer_starts(k, w, weights):
+    """The nine starts (m0, s0) of the outer search of fit_svi.
+
+    m0 in {-1, 0, 1}·h, clipped into the quoted range [min k, max k], and s0
+    in {0.5, 1, 2}·h (at least 1e-4), with the scale h = √(Σ ω·w), close to
+    the ATM total vol because vega weights peak at the money. The order is
+    m0 first, then s0.
+
+    Parameters
+    ----------
+    k, w, weights
+        As in fit_svi.
+
+    Returns
+    -------
+    list of (float, float)
+        The nine (m0, s0), in units of k.
+    """
+    k, w, weights = _slice_arrays(k, w, weights)
+    return _outer_starts(k, w, weights)
+
+
 def fit_svi(k, w, weights):
     """Quasi-explicit raw SVI calibration of one expiry (Zeliade).
 
     The outer problem minimises the inner objective (quasi_explicit_inner),
     divided by Σ ω·w², over (m, s) with Nelder-Mead, m bounded to the quoted
     range [min k, max k] and s >= 1e-4, with xatol 1e-10 and fatol 1e-16. It
-    runs from nine starts, m0 in {-1, 0, 1}·h clipped into the range and s0
-    in {0.5, 1, 2}·h, with the scale h = √(Σ ω·w) (close to the ATM total
-    vol, because vega weights peak at the money), and keeps the best. m is
-    bounded because the vertex of the smile is identified only inside the
+    runs from nine starts (outer_starts), m0 in {-1, 0, 1}·h clipped into
+    the range and s0 in {0.5, 1, 2}·h, with the scale h = √(Σ ω·w) (close to
+    the ATM total vol, because vega weights peak at the money), and keeps the
+    best. m is bounded because the vertex of the smile is identified only inside the
     quoted range: outside it, m extrapolates the unquoted wing.
 
     At a trial (m, s) of the search whose SLSQP solve fails three times, the
@@ -376,19 +405,16 @@ def fit_svi(k, w, weights):
     k, w, weights = _slice_arrays(k, w, weights)
     k_lo, k_hi = float(k.min()), float(k.max())
     scale = weights @ (w * w)
-    h = np.sqrt(weights @ w)
 
     def outer(x):
         return _inner(k, w, weights, x[0], x[1], strict=False)[3] / scale
 
     best = None
-    for m0 in _START_M:
-        for s0 in _START_S:
-            start = [min(max(m0 * h, k_lo), k_hi), max(s0 * h, S_MIN)]
-            result = minimize(outer, start, method="Nelder-Mead", bounds=[(k_lo, k_hi), (S_MIN, None)],
-                              options=_NM_OPTIONS)
-            if best is None or result.fun < best.fun:
-                best = result
+    for start in _outer_starts(k, w, weights):
+        result = minimize(outer, list(start), method="Nelder-Mead", bounds=[(k_lo, k_hi), (S_MIN, None)],
+                          options=_NM_OPTIONS)
+        if best is None or result.fun < best.fun:
+            best = result
     m, s = (float(x) for x in best.x)
     a, c, d, objective = _inner(k, w, weights, m, s)
     a, b, rho = _raw_from_inner(a, c, d, s)

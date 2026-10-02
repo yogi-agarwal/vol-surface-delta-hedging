@@ -11,6 +11,7 @@ from volsurf.svi import (
     SVIFit,
     fit_svi,
     fit_svi_direct,
+    outer_starts,
     quasi_explicit_inner,
     raw_svi,
     svi_constraints,
@@ -199,6 +200,20 @@ def test_direct_fit_does_not_beat_quasi_explicit():
         assert direct.objective == pytest.approx(svi_objective(k, w, weights, *direct[:5]), abs=1e-20)
     # Its starts come from the documented seed: the same seed gives the same fit.
     assert fit_svi_direct(k, w, weights) == direct
+
+
+def test_outer_starts():
+    # Nine starts, m0 in {-1, 0, 1}·h clipped into the quoted range, then s0 in {0.5, 1, 2}·h, h = √(Σ ω·w).
+    k, w, weights = _slice(TRUE)
+    h = math.sqrt((weights / weights.sum()) @ w)
+    starts = outer_starts(k, w, weights)
+    assert len(starts) == 9
+    expected = [(min(max(m0 * h, k.min()), k.max()), s0 * h) for m0 in (-1, 0, 1) for s0 in (0.5, 1, 2)]
+    np.testing.assert_allclose(starts, expected, rtol=1e-15, atol=0)
+    # A narrow quoted range clips m0 onto its ends.
+    narrow = k[(k >= -0.05) & (k <= 0.05)]  # 9 quotes, narrower than h
+    starts = outer_starts(narrow, raw_svi(narrow, *TRUE), np.ones(narrow.size))
+    assert {m0 for m0, _ in starts} == {narrow.min(), 0.0, narrow.max()}
 
 
 def test_fit_svi_rejects_bad_slices():
