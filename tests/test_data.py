@@ -498,6 +498,18 @@ def test_frozen_chain_integrity(chain_name):
     pd.testing.assert_frame_equal(clean_chain(raw, chain["rate"].iloc[0], spot_bar), chain)
 
 
+def test_frozen_primary_snapshot():
+    # DESIGN section 5: among the snapshots with bars saved at pull time, the primary is the one with the
+    # lower median near-the-money relative spread of its frozen chain, a tie going to the later snapshot.
+    eligible = ["spy_chain_20261001T151531Z.parquet", "spy_chain_20261002T151346Z.parquet"]
+    chains = {raw: chain for chain, raw in FROZEN_SNAPSHOTS.items()}
+    spreads = {raw: near_money_spread(pd.read_parquet(FROZEN_HISTORY.with_name(chains[raw]))) for raw in eligible}
+    print({raw: f"{100 * spread:.4f}%" for raw, spread in spreads.items()})
+    primary = primary_snapshot(spreads)
+    assert spreads[primary] == min(spreads.values())
+    assert primary == "spy_chain_20261002T151346Z.parquet"
+
+
 def test_frozen_irx_closes(history):
     # The closes after the history's last date, frozen for the later snapshots, without touching the history.
     entry = json.loads(FROZEN_MANIFEST.read_text())["irx_closes"]
