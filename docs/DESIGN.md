@@ -231,6 +231,7 @@ Tables
 - Overlapping windows are not independent: report the non-overlapping subsample and moving block bootstrap intervals.
 - SPY options are American; European pricing on OTM quotes leaves a small early-exercise bias, largest for long-dated puts.
 - The parity forwards come from American quotes. With D fixed from ^IRX and only pairs with K ≤ S, where the put is out of the money, the forward still carries a small early-exercise bias; a binomial de-Americanisation of the prices is the fix, left as an extension.
+- The out-of-the-money selection switches from puts to calls at S_bar, the spot at the quote time, rather than at F. The motivation is American early exercise: the puts with S_bar ≤ K < F are in the money against the spot, and their early-exercise premium raises their implied vol (section 5). The empirical support, a smaller put-to-call step at S_bar than at F, held on every expiry on 2026-09-30, but not on two expiries on 2026-10-01 (2026-10-16 and 2026-12-18) or on one on 2026-10-02 (2027-01-15: -0.50 vol points at S_bar against -0.38 at F). The Stage 6 section of the notebook prints the count per snapshot.
 - VIX is a variance-swap level and sits above ATM vol by the section 8 gap; the sensitivity bounds its effect.
 - The comparison crosses underlyings: VIX is an SPX variance-swap level, while the hedged underlying and the OptionMetrics ATM vol are SPY, so σ_i = VIX also carries any difference between SPX and SPY implied vol.
 - One snapshot: the surface describes a single moment.
