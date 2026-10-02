@@ -69,6 +69,7 @@ _MAX_ROUNDS = 10  # exchange rounds of the refit after its first solve
 _MINIMISER_XTOL = 1e-12  # tolerance in k of the bounded search for a margin minimum between fine-grid points
 _SLSQP_OPTIONS = {"ftol": 1e-15, "maxiter": 1000}
 _SLSQP_RUNS = 3  # SLSQP is restarted from its own point when it reports failure, at most this many runs in all
+_SLSQP_LINESEARCH = 8  # SLSQP exit mode "Positive directional derivative for linesearch"
 T_BRIDGE = 30 / 365  # maturity of the variance-swap bridge, years
 _QUAD_LIMIT, _QUAD_EPSABS, _QUAD_EPSREL = 1000, 1e-15, 1e-13  # adaptive quadrature of the bridge
 _Z_MAX = 12.0  # Gatheral's z-integral runs over [-12, 12]
@@ -339,8 +340,22 @@ def _exchange_points(fine, params, previous, tol):
     return np.union1d(fine[_violations(fine, params, previous, tol)], _margin_minimisers(fine, params, previous, tol))
 
 
+def _meets_constraints(x, constraints, bounds, tol=VIOLATION_TOL):
+    """True when x satisfies every inequality constraint and every bound of an SLSQP problem to tol."""
+    if any(np.min(c["fun"](x)) < -tol for c in constraints):
+        return False
+    return all((lo is None or xi >= lo - tol) and (hi is None or xi <= hi + tol) for xi, (lo, hi) in zip(x, bounds))
+
+
 def _constrained_solve(k, w, weights, x0, points, previous, k_lo, k_hi):
-    """SLSQP solution (a, c, d, m, s) of the refit with constraints at the points (see refit_slice)."""
+    """SLSQP solution (a, c, d, m, s) of the refit with constraints at the points (see refit_slice).
+
+    A run that reports failure restarts from its own point, at most three
+    runs. When the third still fails, its point is kept only if SLSQP stopped
+    on a failed line search (exit mode 8) and the point meets every
+    constraint and bound of the solve to VIOLATION_TOL; otherwise the solve
+    raises RuntimeError.
+    """
     v = weights @ w  # (a, c, d) enter the solver divided by v, so its variables are of order 1
     scale = weights @ (w * w)
     sv = np.array([v, v, v, 1.0, 1.0])
@@ -392,7 +407,8 @@ def _constrained_solve(k, w, weights, x0, points, previous, k_lo, k_hi):
         if result.success:
             break
     else:
-        raise RuntimeError(f"the constrained refit did not converge: {result.message}")
+        if not (result.status == _SLSQP_LINESEARCH and _meets_constraints(x, constraints, bounds)):
+            raise RuntimeError(f"the constrained refit did not converge: {result.message}")
     a, c, d, m, s = x * sv
     m, s = min(max(m, k_lo), k_hi), max(s, S_MIN)
     return (*_project_inner(a, c, d, s), m, s)
@@ -422,7 +438,10 @@ def refit_slice(k, w, weights, start, previous=None, force=False, tol=VIOLATION_
     The Stage 3 constraints are c >= |d|, c + |d| <= 2s and the cone
     c >= √(d² + min(a, 0)²), as in svi.quasi_explicit_inner, with bounds on
     m and s. A run that reports failure restarts from its own point, at most
-    three runs, and the solution is moved onto the Stage 3 constraint set.
+    three runs; when the third still fails, its point is kept only if SLSQP
+    stopped on a failed line search (exit mode 8) and the point meets every
+    constraint and bound of the solve to VIOLATION_TOL. The solution is moved
+    onto the Stage 3 constraint set.
     Then the exchange rounds: every fine-grid point where a margin (g or the
     calendar margin) is below -tol joins the constraint points, and so does
     the minimiser of a margin between fine-grid neighbours when the margin
@@ -458,9 +477,10 @@ def refit_slice(k, w, weights, start, previous=None, force=False, tol=VIOLATION_
     Raises
     ------
     RuntimeError
-        If SLSQP does not converge in three runs, or a violation on the
-        fine grid or between its points is left after max_rounds exchange
-        rounds.
+        If SLSQP does not converge in three runs and the last run did not
+        stop on a failed line search at a point that meets every constraint,
+        or a violation on the fine grid or between its points is left after
+        max_rounds exchange rounds.
     """
     k, w, weights = _slice_arrays(k, w, weights)
     k_lo, k_hi = float(k.min()), float(k.max())

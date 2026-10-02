@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 from scipy.integrate import quad, simpson
 
+import volsurf.arbitrage
 from volsurf.arbitrage import (
     N_CERTIFY,
     N_FINE,
@@ -285,6 +286,39 @@ def test_refit_surface_and_restarts():
     assert min(r.fit.objective for r in solved) >= results[1].fit.objective - CROSS_CHECK_TOL
     with pytest.raises(ValueError, match="one entry per slice"):
         refit_surface(quotes, [DESIGN_SLICE])
+
+
+def test_refit_keeps_only_a_feasible_line_search_stop(monkeypatch):
+    # Every SLSQP run is made to report failure. A stop on a failed line search (exit mode 8) at a point that
+    # meets every constraint is kept; another exit mode, or the same stop at an infeasible point, raises.
+    k, w, weights = _quotes(SHORT, SHORT_K, SHORT_T)
+    expected = refit_slice(k, w, weights, SHORT)
+    real_minimize = volsurf.arbitrage.minimize
+
+    def failing(status, spoil=None):
+        def fake(*args, **kwargs):
+            result = real_minimize(*args, **kwargs)
+            if spoil is not None:
+                result.x = spoil(result.x.copy())
+            result.success, result.status, result.message = False, status, f"exit mode {status}"
+            return result
+        return fake
+
+    def break_c(x):
+        x[1] = -abs(x[2]) - 1.0  # c below -|d|: breaks c >= |d|
+        return x
+
+    monkeypatch.setattr(volsurf.arbitrage, "minimize", failing(8))
+    kept = refit_slice(k, w, weights, SHORT)
+    assert kept.refitted
+    _assert_clean(kept.fit, k)
+    assert kept.fit.objective == pytest.approx(expected.fit.objective, rel=1e-8)
+    monkeypatch.setattr(volsurf.arbitrage, "minimize", failing(4))
+    with pytest.raises(RuntimeError, match="did not converge: exit mode 4"):
+        refit_slice(k, w, weights, SHORT)
+    monkeypatch.setattr(volsurf.arbitrage, "minimize", failing(8, break_c))
+    with pytest.raises(RuntimeError, match="did not converge: exit mode 8"):
+        refit_slice(k, w, weights, SHORT)
 
 
 @pytest.fixture(scope="module")

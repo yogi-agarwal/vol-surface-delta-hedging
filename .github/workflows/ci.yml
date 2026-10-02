@@ -25,4 +25,5 @@ jobs:
       - name: Run the tests
         run: python -m pytest -q -o addopts="" -rs
       - name: Execute the notebook (the OptionMetrics section skips without the licensed files)
+        if: success() || failure()
         run: python -m jupyter nbconvert --to notebook --execute --inplace notebooks/analysis.ipynb

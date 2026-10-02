@@ -484,8 +484,10 @@ def test_frozen_chain_integrity(chain_name):
     otm = np.where(chain["option_type"] == "call", chain["strike"] >= spot_bar, chain["strike"] < spot_bar)
     assert (chain.loc[passed, "status"] == np.where(otm[passed], "kept", "in the money")).all()
     assert (filter_quotes(kept["bid"], kept["ask"], kept["openInterest"]) == "kept").all()
-    np.testing.assert_allclose(chain["k"], np.log(chain["strike"] / chain["F"]), rtol=0, atol=0)
-    np.testing.assert_allclose(chain["D"], np.exp(-chain["rate"] * chain["T"]), rtol=0, atol=0)
+    # k and D to 4 ulp: the frozen values were computed on Windows, and log and exp elsewhere can differ in the
+    # last bits.
+    np.testing.assert_array_max_ulp(chain["k"].to_numpy(), np.log(chain["strike"] / chain["F"]).to_numpy(), maxulp=4)
+    np.testing.assert_array_max_ulp(chain["D"].to_numpy(), np.exp(-chain["rate"] * chain["T"]).to_numpy(), maxulp=4)
     # The rate of the last ^IRX close strictly before the snapshot date: the frozen history, then the later
     # frozen closes.
     rate, rate_date = _rate_before(volsurf.data._rate_history(), chain_name)
