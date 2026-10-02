@@ -17,6 +17,7 @@ from volsurf.data import (
     filter_quotes,
     interp_rate,
     irx_to_rate,
+    load_irx_closes,
     load_chain,
     load_history,
     load_minute_bars,
@@ -24,9 +25,11 @@ from volsurf.data import (
     load_optionmetrics,
     load_treasury_curve,
     monthly_expiries,
+    near_money_spread,
     nearest_bar_close,
     parity_forward,
     parity_residuals,
+    primary_snapshot,
     select_expiries,
     snapshot_spot_bar,
     snapshot_vix_bar,
@@ -801,6 +804,124 @@ def test_frozen_vix_bars():
     assert entry["vix_bar"]["close"] == bar["close"]
     assert entry["vix_bar"]["bar_start"] == bar["bar_start"].isoformat()
     assert abs(bar["bar_end"] - quote_time) <= pd.Timedelta(seconds=30)
+
+def test_load_irx_closes(tmp_path, monkeypatch):
+    monkeypatch.setattr(volsurf.data, "_FROZEN", tmp_path)
+    monkeypatch.setattr(volsurf.data, "_MANIFEST", tmp_path / "manifest.json")
+    monkeypatch.setattr(yfinance, "download", _no_network)
+    assert load_irx_closes().empty  # without the frozen file and without refresh, nothing is downloaded
+
+    calls = []
+
+    def _download(ticker, **kwargs):
+        calls.append((ticker, kwargs["start"], kwargs["end"]))
+        index = pd.DatetimeIndex(["2026-09-29", "2026-09-30", "2026-10-01", "2026-10-02"], name="Date")
+        return pd.DataFrame({"Close": [4.00, 4.01, np.nan, 4.03], "Open": 4.0}, index=index)
+
+    monkeypatch.setattr(yfinance, "download", _download)
+    r = load_irx_closes(refresh=True, end="2026-10-02")
+    # From the day after the history's last close, 2026-09-29, up to but not including the end date; the
+    # missing close is dropped, and a row the download repeats from inside the history is ignored.
+    assert calls == [("^IRX", "2026-09-30", "2026-10-02")]
+    assert r.index.tolist() == [pd.Timestamp("2026-09-30")] and r.name == "r"
+    assert r.iloc[0] == pytest.approx(irx_to_rate(0.0401), rel=1e-15)
+    stored = pd.read_csv(tmp_path / "irx_closes.csv", index_col="date", parse_dates=["date"])
+    assert stored["d"].tolist() == [pytest.approx(0.0401, rel=1e-15)]  # the frozen file keeps d, like the history
+    entry = json.loads((tmp_path / "manifest.json").read_text())["irx_closes"]
+    assert entry["after_history"] == "2026-09-29" and entry["row_count"] == 1
+    assert entry["start_date"] == entry["end_date"] == "2026-09-30" and entry["ticker"] == "^IRX"
+
+    monkeypatch.setattr(yfinance, "download", _no_network)
+    pd.testing.assert_series_equal(load_irx_closes(), r, check_freq=False)  # the frozen file
+    monkeypatch.setattr(yfinance, "download", lambda ticker, **kwargs: pd.DataFrame({"Close": []}))
+    with pytest.raises(ValueError, match="no \\^IRX close"):
+        load_irx_closes(refresh=True, end="2026-10-02")
+
+
+def test_snapshot_rate_after_the_history(tmp_path, monkeypatch, history):
+    # A snapshot takes the last close strictly before its date: from the frozen history up to 2026-09-29,
+    # then from the later frozen closes.
+    monkeypatch.setattr(volsurf.data, "_FROZEN", tmp_path)
+    later = pd.DataFrame({"d": [0.0401, 0.0402]}, index=pd.DatetimeIndex(["2026-09-30", "2026-10-01"], name="date"))
+    later.to_csv(tmp_path / "irx_closes.csv")
+    rates = volsurf.data._rate_history()
+    assert rates.index.is_monotonic_increasing and rates.index.is_unique
+    for date, expected, rate_date in (
+        ("2026-09-30", history.loc["2026-09-29", "r"], "2026-09-29"),
+        ("2026-10-01", irx_to_rate(0.0401), "2026-09-30"),
+        ("2026-10-02", irx_to_rate(0.0402), "2026-10-01"),
+    ):
+        rate, when = volsurf.data._snapshot_rate(rates, pd.Timestamp(date))
+        assert rate == pytest.approx(expected, rel=1e-15) and when == pd.Timestamp(rate_date)
+
+
+def test_load_chain_freezes_the_bars_saved_with_the_pull(tmp_path, monkeypatch):
+    frozen, raw_dir = tmp_path / "frozen", tmp_path / "raw"
+    frozen.mkdir()
+    raw_dir.mkdir()
+    monkeypatch.setattr(volsurf.data, "_FROZEN", frozen)
+    monkeypatch.setattr(volsurf.data, "_MANIFEST", frozen / "manifest.json")
+    monkeypatch.setattr(volsurf.data, "_RAW", raw_dir)
+    monkeypatch.setattr(yfinance, "download", _no_network)
+    monkeypatch.setattr(yfinance, "Ticker", _no_network)
+    snapshot = raw_dir / "spy_chain_20260930T192047Z.parquet"
+    _synthetic_snapshot().to_parquet(snapshot)
+    saved = _session_bars(base=SPOT - 2.5)
+    saved.index = saved.index.tz_convert("UTC").rename("bar_start")
+    saved = saved[saved.index <= FETCH][["Open", "High", "Low", "Close", "Volume"]]
+    saved.to_parquet(raw_dir / "spy_1m_20260930T192047Z.parquet")  # no frozen day file exists
+
+    chain = load_chain(snapshot.name)
+    copy = frozen / "spy_1m_20260930T192047Z.parquet"
+    pd.testing.assert_frame_equal(pd.read_parquet(copy), pd.read_parquet(raw_dir / copy.name))
+    manifest = json.loads((frozen / "manifest.json").read_text())
+    bars_entry = manifest["minute_bars"][copy.name]
+    assert bars_entry["source"] == "saved with the pull" and bars_entry["snapshot"] == snapshot.name
+    assert bars_entry["row_count"] == len(saved) and bars_entry["date"] == "2026-09-30"
+    assert bars_entry["last_bar"] == saved.index[-1].isoformat()
+    spot_bar = manifest["chains"]["chain_20260930.parquet"]["spot_bar"]
+    assert spot_bar["bars"] == copy.name and spot_bar["close"] == nearest_bar_close(saved, FETCH)["close"]
+
+    # Without data/raw/, the frozen copy reproduces the spot entries, with no download and no rewrite.
+    for path in raw_dir.iterdir():
+        path.unlink()
+    text = (frozen / "manifest.json").read_text()
+    spots = snapshot_spot_bar(snapshot.name)
+    assert spots["spot_bar"] == spot_bar and (frozen / "manifest.json").read_text() == text
+    pd.testing.assert_frame_equal(load_chain(snapshot.name), chain)
+
+
+def test_near_money_spread():
+    # Spot quote 100, band |ln(K/100)| <= 0.05: strikes 96 to 105 are inside, 94 and 106 outside.
+    chain = pd.DataFrame({
+        "strike": [94.0, 96.0, 99.0, 100.0, 103.0, 105.0, 106.0, 101.0],
+        "bid": [1.0, 1.0, 2.0, 3.0, 1.0, 1.0, 1.0, 0.0],
+        "ask": [3.0, 1.2, 2.2, 3.3, 1.4, 1.1, 2.0, 0.5],
+        "status": ["kept"] * 7 + ["zero bid"],
+        "spot_start": 100.0,
+    })
+    chain["mid"] = (chain["bid"] + chain["ask"]) / 2
+    # Inside: 0.2/1.1, 0.2/2.1, 0.3/3.15, 0.4/1.2 and 0.1/1.05; the zero-bid contract is not kept.
+    expected = np.median([0.2 / 1.1, 0.2 / 2.1, 0.3 / 3.15, 0.4 / 1.2, 0.1 / 1.05])
+    assert near_money_spread(chain) == pytest.approx(expected, rel=1e-14)
+    assert near_money_spread(chain, band=0.0) == pytest.approx(0.3 / 3.15, rel=1e-14)  # the strike at the spot
+    with pytest.raises(ValueError, match="near-the-money"):
+        near_money_spread(chain[chain["strike"] < 95])
+
+
+def test_primary_snapshot():
+    early, late = "spy_chain_20261001T151531Z.parquet", "spy_chain_20261002T151346Z.parquet"
+    assert primary_snapshot({early: 0.010, late: 0.012}) == early  # the lower median wins
+    assert primary_snapshot({late: 0.012, early: 0.013}) == late
+    assert primary_snapshot({late: 0.011, early: 0.011}) == late  # a tie goes to the later snapshot
+    assert primary_snapshot({early: 0.011}) == early
+    with pytest.raises(ValueError, match="no eligible"):
+        primary_snapshot({})
+    with pytest.raises(ValueError, match="spy_chain"):
+        primary_snapshot({"chain_20261001.parquet": 0.01})
+    with pytest.raises(ValueError, match="not finite"):
+        primary_snapshot({early: np.nan, late: 0.01})
+
 
 UST_SERIES = ["DGS1MO", "DGS3MO", "DGS6MO", "DGS1", "DGS2", "DGS3"]
 UST_TENORS = np.array([1 / 12, 0.25, 0.5, 1.0, 2.0, 3.0])

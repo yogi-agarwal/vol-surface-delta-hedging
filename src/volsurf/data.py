@@ -12,6 +12,8 @@ Index    : DatetimeIndex of SPY trading days at midnight, tz-naive
 
 data/frozen/history.parquet stores d itself in column r; load_history
 converts it on every load, so the frozen file never needs re-downloading.
+The ^IRX closes after the history's last date, which chain snapshots taken
+later need, are frozen as d in data/frozen/irx_closes.csv (load_irx_closes).
 
 OptionMetrics columns (as returned by load_optionmetrics)
 ---------------------------------------------------------
@@ -63,7 +65,8 @@ Index                  : DatetimeIndex of bar starts in UTC, named bar_start
 data/frozen/spy_1m_YYYYMMDD.parquet stores one day's SPY bars; snapshot_spot_bar
 matches them to a chain snapshot. A snapshot collected from 2026-10-01 also
 has the bars saved with its pull, data/raw/spy_1m_YYYYMMDDTHHMMSSZ.parquet
-(same columns and index), which snapshot_spot_bar reads first.
+(same columns and index), which snapshot_spot_bar reads first; load_chain
+freezes a copy under the same name in data/frozen/.
 data/frozen/vix_1m_YYYYMMDD.parquet stores one day's ^VIX bars, which
 snapshot_vix_bar reads for VIX at a snapshot's quote time.
 
@@ -93,6 +96,7 @@ _HISTORY = _FROZEN / "history.parquet"
 _MANIFEST = _FROZEN / "manifest.json"
 _START = "2021-06-01"
 _BILL_DAYS = 91  # ^IRX quotes the 13-week (91-day) bill
+_IRX_CLOSES = "irx_closes.csv"  # ^IRX closes after the end of the frozen history, for later chain snapshots
 
 _NY = ZoneInfo("America/New_York")
 _YEAR_SECONDS = 365 * 86400  # ACT/365
@@ -217,6 +221,77 @@ def load_history(refresh: bool = False) -> pd.DataFrame:
 
     df["r"] = irx_to_rate(df["r"])
     return df
+
+
+def load_irx_closes(refresh=False, end=None):
+    """^IRX closes after the end of the frozen history, as continuously compounded rates.
+
+    A chain snapshot is priced at the rate of the last ^IRX close strictly
+    before its own date (DESIGN.md section 5). The frozen history ends on its
+    download date, and refreshing it would add Stage 5 windows, so the closes
+    that later snapshots need are frozen separately in
+    data/frozen/irx_closes.csv, as the discount yield d = close / 100 (like
+    the history), with an entry under "irx_closes" in
+    data/frozen/manifest.json. Only refresh=True downloads: the closes from
+    the day after the history's last date up to, but not including, end, so
+    an unfinished session is never stored.
+
+    Parameters
+    ----------
+    refresh : bool
+        If True, download the closes and overwrite the frozen file.
+    end : date-like, optional
+        First date not downloaded; today in New York by default.
+
+    Returns
+    -------
+    pd.Series
+        irx_to_rate(d) on a tz-naive DatetimeIndex named date, named r;
+        empty when the frozen file does not exist and refresh is False.
+
+    Raises
+    ------
+    ValueError
+        If a download returns no close in the range.
+    """
+    path = _FROZEN / _IRX_CLOSES
+    if not refresh:
+        if not path.exists():
+            return pd.Series(dtype=float, name="r", index=pd.DatetimeIndex([], name="date"))
+        d = pd.read_csv(path, index_col="date", parse_dates=["date"])["d"]
+        return irx_to_rate(d).rename("r")
+
+    last = load_history().index[-1]
+    end = pd.Timestamp(datetime.now(_NY).date()) if end is None else pd.Timestamp(end).normalize()
+    close = yfinance.download(
+        "^IRX", start=f"{last + pd.Timedelta(days=1):%Y-%m-%d}", end=f"{end:%Y-%m-%d}", auto_adjust=False,
+        progress=False, multi_level_index=False,
+    )["Close"]
+    dates = pd.DatetimeIndex(close.index).tz_localize(None).normalize()
+    d = pd.Series(close.to_numpy() / 100, index=dates.rename("date"), name="d").dropna()
+    d = d[(d.index > last) & (d.index < end)]
+    if d.empty:
+        raise ValueError(f"no ^IRX close after {last.date()} and before {end.date()}")
+    _FROZEN.mkdir(parents=True, exist_ok=True)
+    d.to_csv(path)
+    _update_manifest({"irx_closes": {
+        "utc_timestamp": datetime.now(timezone.utc).isoformat(),
+        "file": path.name,
+        "ticker": "^IRX",
+        "yfinance_version": yfinance.__version__,
+        "after_history": str(last.date()),
+        "start_date": str(d.index[0].date()),
+        "end_date": str(d.index[-1].date()),
+        "row_count": len(d),
+    }})
+    return irx_to_rate(d).rename("r")
+
+
+def _rate_history():
+    """The frozen history's rates followed by the later frozen ^IRX closes, one series in date order."""
+    r = load_history()["r"]
+    later = load_irx_closes()
+    return pd.concat([r, later[later.index > r.index[-1]]])
 
 
 def _update_manifest(entries):
@@ -667,6 +742,72 @@ def chain_summary(chain, spot=None):
     return pd.DataFrame(rows).set_index("expiry")
 
 
+def near_money_spread(chain, band=_BAND):
+    """Median relative bid-ask spread of the near-the-money kept quotes of a cleaned chain.
+
+    The metric of the primary-snapshot rule (DESIGN.md section 5): the median
+    of (ask - bid)/mid over the contracts with status kept (after the Stage 2b
+    filters and the out-of-the-money selection, before the no-IV filter), all
+    expiries pooled, with |ln(K/S)| <= band and S the spot quote spot_start,
+    as in the fit bands.
+
+    Parameters
+    ----------
+    chain : pd.DataFrame
+        Output of clean_chain or load_chain.
+    band : float, default 0.05
+        Half-width of the near-the-money band in ln(K/S).
+
+    Returns
+    -------
+    float
+        The median relative spread, as a decimal.
+
+    Raises
+    ------
+    ValueError
+        If no kept quote lies inside the band.
+    """
+    kept = chain[chain["status"] == "kept"]
+    near = np.abs(np.log(kept["strike"] / kept["spot_start"])) <= band
+    if not near.any():
+        raise ValueError("no kept quote inside the near-the-money band")
+    spread = (kept["ask"] - kept["bid"]) / kept["mid"]
+    return float(spread[near].median())
+
+
+def primary_snapshot(spreads):
+    """The primary snapshot: the lower median near-the-money spread, a tie going to the later snapshot.
+
+    Parameters
+    ----------
+    spreads : dict of str to float
+        Raw snapshot file name (spy_chain_YYYYMMDDTHHMMSSZ.parquet) of each
+        eligible snapshot and its near_money_spread.
+
+    Returns
+    -------
+    str
+        The file name of the primary.
+
+    Raises
+    ------
+    ValueError
+        If spreads is empty, a name does not match, or a spread is not finite.
+    """
+    if not spreads:
+        raise ValueError("no eligible snapshot")
+    best = None
+    for name in sorted(spreads):  # the timestamped names sort in time
+        if _SNAPSHOT_NAME.fullmatch(name) is None:
+            raise ValueError(f"{name} is not a spy_chain_YYYYMMDDTHHMMSSZ.parquet snapshot")
+        if not np.isfinite(spreads[name]):
+            raise ValueError(f"the spread of {name} is not finite")
+        if best is None or spreads[name] <= spreads[best]:  # <=: equal spreads go to the later snapshot
+            best = name
+    return best
+
+
 def _snapshot_rate(r, snapshot_date):
     """Last rate strictly before the snapshot date, and its date.
 
@@ -700,14 +841,17 @@ def load_chain(snapshot, refresh=False):
     snapshot's file name. When it exists and refresh is False it is read and
     the raw snapshot is not needed. Otherwise the raw snapshot is cleaned
     with clean_chain at the rate of the last ^IRX close strictly before the
-    snapshot's New York date (from load_history) and at S_bar, the spot at
-    the quote time: the close of the SPY 1-minute bar nearest the latest
-    option trade of the selected expiries. The bars come from the sources
-    snapshot_spot_bar reads (the bars saved with the pull, then the frozen
-    day file), and the day is downloaded only when neither exists. The chain
-    is written to the frozen file and recorded under "chains" in
-    data/frozen/manifest.json, with the spot_bar and spot_bar_fetch entries
-    that snapshot_spot_bar returns.
+    snapshot's New York date (from load_history, then the later closes of
+    load_irx_closes) and at S_bar, the spot at the quote time: the close of
+    the SPY 1-minute bar nearest the latest option trade of the selected
+    expiries. The bars come from the sources snapshot_spot_bar reads (the
+    bars saved with the pull, then their frozen copy, then the frozen day
+    file), and the day is downloaded only when none exists. Bars saved with
+    the pull are first copied into data/frozen/ under the same name, with an
+    entry under "minute_bars" in the manifest, so a fresh install reproduces
+    S_bar without data/raw/. The chain is written to the frozen file and
+    recorded under "chains" in data/frozen/manifest.json, with the spot_bar
+    and spot_bar_fetch entries that snapshot_spot_bar returns.
 
     Parameters
     ----------
@@ -740,8 +884,9 @@ def load_chain(snapshot, refresh=False):
     raw = pd.read_parquet(path)
     first, last = raw["fetch_utc"].min(), raw["fetch_utc"].max()
     snapshot_date = first.tz_convert(_NY).normalize().tz_localize(None)
-    rate, rate_date = _snapshot_rate(load_history()["r"], snapshot_date)
+    rate, rate_date = _snapshot_rate(_rate_history(), snapshot_date)
     quote_time = raw.loc[raw["expiry"].isin(_selected_expiries(raw)), "lastTradeDate"].max()
+    _freeze_saved_bars(path)
     bars, bars_name = _snapshot_bars(path, snapshot_date)
     spots = _spot_entries(bars, bars_name, quote_time, first)
     chain = clean_chain(raw, rate, spots["spot_bar"]["close"])
@@ -898,14 +1043,46 @@ def _snapshot_bars(path, day, refresh=False):
     """The 1-minute bars of a raw snapshot and the name of the file they come from.
 
     The bars saved with the pull (spy_1m_YYYYMMDDTHHMMSSZ.parquet next to the
-    snapshot path) when they exist, else load_minute_bars(day, refresh),
-    which reads data/frozen/spy_1m_YYYYMMDD.parquet and downloads the day
-    only when that file is missing or refresh is True.
+    snapshot path) when they exist, else their frozen copy under the same
+    name in data/frozen/, else load_minute_bars(day, refresh), which reads
+    data/frozen/spy_1m_YYYYMMDD.parquet and downloads the day only when that
+    file is missing or refresh is True.
     """
-    saved = path.with_name(path.name.replace("spy_chain_", "spy_1m_", 1))
-    if saved.exists():
-        return pd.read_parquet(saved), saved.name
+    name = path.name.replace("spy_chain_", "spy_1m_", 1)
+    for saved in (path.with_name(name), _FROZEN / name):
+        if saved.exists():
+            return pd.read_parquet(saved), name
     return load_minute_bars(day, refresh=refresh), minute_bars_name("SPY", day)
+
+
+def _freeze_saved_bars(path):
+    """Copy the bars saved with a pull into data/frozen/ under the same name, with a manifest entry.
+
+    Returns the frozen copy's path, or None when the pull saved no bars
+    (snapshots collected before 2026-10-01).
+    """
+    name = path.name.replace("spy_chain_", "spy_1m_", 1)
+    saved = path.with_name(name)
+    if not saved.exists():
+        return None
+    bars = pd.read_parquet(saved)
+    frozen = _FROZEN / name
+    _FROZEN.mkdir(parents=True, exist_ok=True)
+    bars.to_parquet(frozen)
+    starts = pd.DatetimeIndex(bars.index)
+    _update_manifest({"minute_bars": {name: {
+        "utc_timestamp": datetime.now(timezone.utc).isoformat(),
+        "ticker": "SPY",
+        "source": "saved with the pull",
+        "snapshot": path.name,
+        "interval": "1m",
+        "auto_adjust": False,
+        "date": str(starts[0].tz_convert(_NY).date()),
+        "first_bar": starts[0].isoformat(),
+        "last_bar": starts[-1].isoformat(),
+        "row_count": len(bars),
+    }}})
+    return frozen
 
 
 def _spot_entries(bars, bars_name, quote_time, fetch_first):
@@ -962,8 +1139,10 @@ def snapshot_spot_bar(snapshot, refresh=False):
     The bars come from the first source that exists: the bars saved with the
     pull, spy_1m_YYYYMMDDTHHMMSSZ.parquet next to the snapshot (under the
     same UTC timestamp, written by scripts/collect_chain.py from 2026-10-01);
-    then load_minute_bars, which reads data/frozen/spy_1m_YYYYMMDD.parquet
-    and downloads the day only when that file is missing.
+    then their frozen copy under the same name in data/frozen/ (written by
+    load_chain); then load_minute_bars, which reads
+    data/frozen/spy_1m_YYYYMMDD.parquet and downloads the day only when that
+    file is missing.
 
     Parameters
     ----------
