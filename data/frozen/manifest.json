@@ -54,6 +54,14 @@
         "bar_end": "2026-09-30T19:21:00+00:00",
         "target_utc": "2026-09-30T19:20:47.665955+00:00",
         "bars": "spy_1m_20260930.parquet"
+      },
+      "vix_bar": {
+        "close": 15.949999809265137,
+        "source": "1-minute bar",
+        "target_utc": "2026-09-30T19:05:42+00:00",
+        "bar_start": "2026-09-30T19:05:00+00:00",
+        "bar_end": "2026-09-30T19:06:00+00:00",
+        "bars": "vix_1m_20260930.parquet"
       }
     }
   },
@@ -68,6 +76,17 @@
       "first_bar": "2026-09-30T13:30:00+00:00",
       "last_bar": "2026-09-30T19:59:00+00:00",
       "row_count": 390
+    },
+    "vix_1m_20260930.parquet": {
+      "utc_timestamp": "2026-10-02T04:17:59.172892+00:00",
+      "ticker": "^VIX",
+      "yfinance_version": "1.7.0",
+      "interval": "1m",
+      "auto_adjust": false,
+      "date": "2026-09-30",
+      "first_bar": "2026-09-30T07:15:00+00:00",
+      "last_bar": "2026-09-30T20:14:00+00:00",
+      "row_count": 775
     }
   },
   "curves": {

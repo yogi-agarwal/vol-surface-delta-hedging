@@ -54,15 +54,18 @@ bars' start times).
 
 Minute bars (as returned by load_minute_bars)
 ---------------------------------------------
-Open, High, Low, Close : unadjusted SPY prices of each regular-session
-                         1-minute bar
-Volume                 : shares traded in the bar
+Open, High, Low, Close : unadjusted prices of each 1-minute bar (SPY in
+                         dollars, regular session; ^VIX in index points,
+                         global trading hours included)
+Volume                 : shares traded in the bar (0 for ^VIX)
 Index                  : DatetimeIndex of bar starts in UTC, named bar_start
 
-data/frozen/spy_1m_YYYYMMDD.parquet stores one day's bars; snapshot_spot_bar
+data/frozen/spy_1m_YYYYMMDD.parquet stores one day's SPY bars; snapshot_spot_bar
 matches them to a chain snapshot. A snapshot collected from 2026-10-01 also
 has the bars saved with its pull, data/raw/spy_1m_YYYYMMDDTHHMMSSZ.parquet
 (same columns and index), which snapshot_spot_bar reads first.
+data/frozen/vix_1m_YYYYMMDD.parquet stores one day's ^VIX bars, which
+snapshot_vix_bar reads for VIX at a snapshot's quote time.
 
 Treasury curve (as returned by load_treasury_curve)
 ---------------------------------------------------
@@ -803,13 +806,38 @@ def nearest_bar_close(bars, when):
     return {"close": float(bars["Close"].iloc[i]), "bar_start": starts[i], "bar_end": ends[i]}
 
 
-def load_minute_bars(date, refresh=False):
-    """SPY 1-minute bars of one New York trading day, read from data/frozen/ or downloaded.
+class NoBarsError(ValueError):
+    """A 1-minute bar download that returned no bars (Yahoo keeps them for about 30 days)."""
 
-    The frozen file is data/frozen/spy_1m_YYYYMMDD.parquet. It is downloaded
-    from yfinance (regular session, unadjusted) only when it is missing or
-    refresh is True, and the download is recorded under "minute_bars" in
-    data/frozen/manifest.json. Yahoo keeps 1-minute bars for about 30 days.
+
+def minute_bars_name(ticker, date):
+    """File name of a ticker's frozen 1-minute bars: spy_1m_YYYYMMDD.parquet, vix_1m_YYYYMMDD.parquet.
+
+    Parameters
+    ----------
+    ticker : str
+        Yahoo ticker, for example "SPY" or "^VIX"; the name drops a leading
+        ^ and is in lower case.
+    date : date-like
+        The New York trading day.
+
+    Returns
+    -------
+    str
+    """
+    return f"{ticker.lstrip('^').lower()}_1m_{pd.Timestamp(date):%Y%m%d}.parquet"
+
+
+def load_minute_bars(date, refresh=False, ticker="SPY"):
+    """1-minute bars of one ticker on one New York trading day, read from data/frozen/ or downloaded.
+
+    The frozen file is data/frozen/<name>_1m_YYYYMMDD.parquet (minute_bars_name:
+    spy_1m_... for SPY, vix_1m_... for ^VIX). It is downloaded from yfinance
+    (unadjusted) only when it is missing or refresh is True, and the download
+    is recorded under "minute_bars" in data/frozen/manifest.json. The bars are
+    kept as Yahoo returns them: the regular session for SPY, and for ^VIX also
+    the global trading hours bars from 03:15 New York. Yahoo keeps 1-minute
+    bars for about 30 days.
 
     Parameters
     ----------
@@ -817,29 +845,33 @@ def load_minute_bars(date, refresh=False):
         The New York trading day.
     refresh : bool
         If True, download again and overwrite the frozen file.
+    ticker : str, default "SPY"
+        Yahoo ticker.
 
     Returns
     -------
     pd.DataFrame
         One row per bar on a DatetimeIndex of bar starts in UTC, named
-        bar_start, with columns Open, High, Low, Close (currency units) and
-        Volume (shares).
+        bar_start, with columns Open, High, Low, Close (currency units for
+        SPY, index points for ^VIX) and Volume (shares; 0 for an index).
 
     Raises
     ------
+    NoBarsError
+        If a download returns no bars (a ValueError).
     ValueError
-        If a download returns no bars or a bar outside the New York date.
+        If a download holds a bar outside the New York date.
     """
     day = pd.Timestamp(date).normalize()
-    path = _FROZEN / f"spy_1m_{day:%Y%m%d}.parquet"
+    path = _FROZEN / minute_bars_name(ticker, day)
     if not refresh and path.exists():
         return pd.read_parquet(path)
 
-    raw = yfinance.Ticker("SPY").history(
+    raw = yfinance.Ticker(ticker).history(
         start=f"{day:%Y-%m-%d}", end=f"{day + pd.Timedelta(days=1):%Y-%m-%d}", interval="1m", auto_adjust=False
     )
     if raw.empty:
-        raise ValueError(f"no SPY 1-minute bars for {day.date()}; Yahoo keeps them for about 30 days")
+        raise NoBarsError(f"no {ticker} 1-minute bars for {day.date()}; Yahoo keeps them for about 30 days")
     index = pd.DatetimeIndex(raw.index)
     if not (index.tz_convert(_NY).normalize().tz_localize(None) == day).all():
         raise ValueError(f"the download holds bars outside {day.date()} in New York")
@@ -850,7 +882,7 @@ def load_minute_bars(date, refresh=False):
     bars.to_parquet(path)
     _update_manifest({"minute_bars": {path.name: {
         "utc_timestamp": datetime.now(timezone.utc).isoformat(),
-        "ticker": "SPY",
+        "ticker": ticker,
         "yfinance_version": yfinance.__version__,
         "interval": "1m",
         "auto_adjust": False,
@@ -873,7 +905,7 @@ def _snapshot_bars(path, day, refresh=False):
     saved = path.with_name(path.name.replace("spy_chain_", "spy_1m_", 1))
     if saved.exists():
         return pd.read_parquet(saved), saved.name
-    return load_minute_bars(day, refresh=refresh), f"spy_1m_{day:%Y%m%d}.parquet"
+    return load_minute_bars(day, refresh=refresh), minute_bars_name("SPY", day)
 
 
 def _spot_entries(bars, bars_name, quote_time, fetch_first):
@@ -891,6 +923,27 @@ def _spot_entries(bars, bars_name, quote_time, fetch_first):
         }
 
     return {"spot_bar": _entry(quote_time), "spot_bar_fetch": _entry(fetch_first)}
+
+
+def _snapshot_entry(snapshot):
+    """The raw path of a snapshot, its frozen chain's name and that chain's manifest entry.
+
+    A bare file name is looked up in data/raw/. Raises ValueError if the name
+    does not match spy_chain_YYYYMMDDTHHMMSSZ.parquet or the chain is not in
+    the manifest.
+    """
+    path = pathlib.Path(snapshot)
+    match = _SNAPSHOT_NAME.fullmatch(path.name)
+    if match is None:
+        raise ValueError(f"{path.name} is not a spy_chain_YYYYMMDDTHHMMSSZ.parquet snapshot")
+    if path.parent == pathlib.Path("."):
+        path = _RAW / path
+    name = f"chain_{match.group(1)}.parquet"
+    manifest = json.loads(_MANIFEST.read_text()) if _MANIFEST.exists() else {}
+    entry = manifest.get("chains", {}).get(name)
+    if entry is None:
+        raise ValueError(f"{name} is not in the manifest; build it with load_chain first")
+    return path, name, entry
 
 
 def snapshot_spot_bar(snapshot, refresh=False):
@@ -936,18 +989,7 @@ def snapshot_spot_bar(snapshot, refresh=False):
     ValueError
         If the file name does not match, or the chain is not in the manifest.
     """
-    path = pathlib.Path(snapshot)
-    match = _SNAPSHOT_NAME.fullmatch(path.name)
-    if match is None:
-        raise ValueError(f"{path.name} is not a spy_chain_YYYYMMDDTHHMMSSZ.parquet snapshot")
-    if path.parent == pathlib.Path("."):
-        path = _RAW / path
-    name = f"chain_{match.group(1)}.parquet"
-    manifest = json.loads(_MANIFEST.read_text()) if _MANIFEST.exists() else {}
-    entry = manifest.get("chains", {}).get(name)
-    if entry is None:
-        raise ValueError(f"{name} is not in the manifest; build it with load_chain first")
-
+    path, name, entry = _snapshot_entry(snapshot)
     chain = load_chain(snapshot)
     fetch_first = pd.Timestamp(entry["fetch_utc_first"])
     day = fetch_first.tz_convert(_NY).normalize().tz_localize(None)
@@ -956,6 +998,87 @@ def snapshot_spot_bar(snapshot, refresh=False):
     if any(entry.get(key) != value for key, value in spots.items()):
         _update_manifest({"chains": {name: {**entry, **spots}}})
     return spots
+
+
+def _daily_close(ticker, day):
+    """The daily close of a ticker on one date from yfinance (unadjusted), in its own units."""
+    raw = yfinance.download(
+        ticker, start=f"{day:%Y-%m-%d}", end=f"{day + pd.Timedelta(days=1):%Y-%m-%d}", auto_adjust=False,
+        progress=False, multi_level_index=False,
+    )
+    if raw.empty or not (pd.DatetimeIndex(raw.index).normalize() == day).any():
+        raise ValueError(f"no {ticker} daily close for {day.date()}")
+    return float(raw.loc[pd.DatetimeIndex(raw.index).normalize() == day, "Close"].iloc[0])
+
+
+def snapshot_vix_bar(snapshot, refresh=False):
+    """VIX at the quote time of a chain snapshot, recorded in its manifest entry.
+
+    The quote time is the latest option trade in the cleaned chain, the
+    instant that spot_bar is matched to (snapshot_spot_bar). VIX there is the
+    close of the ^VIX 1-minute bar whose close falls nearest it
+    (nearest_bar_close), from load_minute_bars(day, ticker="^VIX"), which
+    reads data/frozen/vix_1m_YYYYMMDD.parquet and downloads the day only when
+    that file is missing or refresh is True. When no bars are frozen and
+    Yahoo returns none (it keeps them for about 30 days), the fallback is the
+    daily ^VIX close of the snapshot day. The result is written to the
+    chain's entry in data/frozen/manifest.json as vix_bar, only when it is
+    missing or different. While no bars are frozen, a recorded daily-close
+    fallback is returned as it is, without a download.
+
+    Parameters
+    ----------
+    snapshot : str or pathlib.Path
+        Raw snapshot spy_chain_YYYYMMDDTHHMMSSZ.parquet, as for load_chain.
+        Its cleaned chain must already be frozen and in the manifest.
+    refresh : bool
+        Passed to load_minute_bars: if True, download the day's bars again.
+
+    Returns
+    -------
+    dict
+        close : the VIX level in index points (VIX/100 is the vol as a decimal)
+        source : "1-minute bar" or "daily close"
+        target_utc : the quote time, ISO 8601 in UTC
+        With a 1-minute bar also bar_start and bar_end (ISO 8601 in UTC) and
+        bars (the frozen file name); with the daily close, date (the
+        snapshot day).
+
+    Raises
+    ------
+    ValueError
+        If the file name does not match, the chain is not in the manifest, or
+        neither the bars nor the daily close can be had.
+    """
+    _, name, entry = _snapshot_entry(snapshot)
+    quote_time = load_chain(snapshot)["lastTradeDate"].max().tz_convert("UTC")
+    day = pd.Timestamp(entry["fetch_utc_first"]).tz_convert(_NY).normalize().tz_localize(None)
+    bars_name = minute_bars_name("^VIX", day)
+    recorded = entry.get("vix_bar")
+    if (not refresh and recorded is not None and recorded.get("source") == "daily close"
+            and not (_FROZEN / bars_name).exists()):
+        return recorded
+
+    try:
+        bar = nearest_bar_close(load_minute_bars(day, refresh=refresh, ticker="^VIX"), quote_time)
+        vix = {
+            "close": bar["close"],
+            "source": "1-minute bar",
+            "target_utc": quote_time.isoformat(),
+            "bar_start": bar["bar_start"].isoformat(),
+            "bar_end": bar["bar_end"].isoformat(),
+            "bars": bars_name,
+        }
+    except NoBarsError:
+        vix = {
+            "close": _daily_close("^VIX", day),
+            "source": "daily close",
+            "target_utc": quote_time.isoformat(),
+            "date": str(day.date()),
+        }
+    if recorded != vix:
+        _update_manifest({"chains": {name: {**entry, "vix_bar": vix}}})
+    return vix
 
 
 def cmt_to_rate(y):

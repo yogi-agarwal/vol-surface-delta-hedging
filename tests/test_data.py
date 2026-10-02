@@ -10,6 +10,7 @@ import yfinance
 import volsurf.data
 from volsurf.black_scholes import black76_price
 from volsurf.data import (
+    NoBarsError,
     chain_summary,
     clean_chain,
     cmt_to_rate,
@@ -19,6 +20,7 @@ from volsurf.data import (
     load_chain,
     load_history,
     load_minute_bars,
+    minute_bars_name,
     load_optionmetrics,
     load_treasury_curve,
     monthly_expiries,
@@ -27,6 +29,7 @@ from volsurf.data import (
     parity_residuals,
     select_expiries,
     snapshot_spot_bar,
+    snapshot_vix_bar,
     time_to_expiry,
     treasury_rates,
 )
@@ -34,6 +37,7 @@ from volsurf.data import (
 FROZEN_HISTORY = pathlib.Path(__file__).resolve().parents[1] / "data" / "frozen" / "history.parquet"
 FROZEN_CHAIN = FROZEN_HISTORY.with_name("chain_20260930.parquet")
 FROZEN_BARS = FROZEN_HISTORY.with_name("spy_1m_20260930.parquet")
+FROZEN_VIX_BARS = FROZEN_HISTORY.with_name("vix_1m_20260930.parquet")
 FROZEN_MANIFEST = FROZEN_HISTORY.with_name("manifest.json")
 FROZEN_CURVE = FROZEN_HISTORY.with_name("ust_curve_20260930.csv")
 RAW_COLUMNS = [  # columns written by scripts/collect_chain.py
@@ -657,6 +661,146 @@ def test_frozen_spot_bars():
         assert entry[key]["target_utc"] == target.tz_convert("UTC").isoformat()
         assert abs(bar["bar_end"] - target) <= pd.Timedelta(seconds=30)
 
+
+
+# ^VIX 1-minute bars: a mocked day of 2026-09-30, 03:15 to 16:14 in New York (global trading hours
+# included), labelled in Chicago time as Yahoo labels them.
+def _vix_bars(day="2026-09-30", base=16.0):
+    index = pd.date_range(f"{day} 03:15", f"{day} 16:14", freq="1min", tz="America/New_York")
+    close = base + 0.001 * np.arange(index.size)  # a distinct close per bar
+    return pd.DataFrame(
+        {"Open": close, "High": close, "Low": close, "Close": close, "Adj Close": close, "Volume": 0,
+         "Dividends": 0.0, "Stock Splits": 0.0},
+        index=index.tz_convert("America/Chicago").rename("Datetime"),
+    )
+
+
+class _RecordingTickers:
+    """Stands in for yfinance.Ticker: one _FakeTicker per symbol, recording the symbols requested."""
+
+    def __init__(self, frames):
+        self.frames, self.symbols, self.fakes = frames, [], {}
+
+    def __call__(self, ticker):
+        self.symbols.append(ticker)
+        return self.fakes.setdefault(ticker, _FakeTicker(self.frames[ticker]))
+
+
+def test_minute_bars_name():
+    assert minute_bars_name("SPY", "2026-09-30") == "spy_1m_20260930.parquet"
+    assert minute_bars_name("^VIX", pd.Timestamp("2026-09-30 15:05")) == "vix_1m_20260930.parquet"
+
+
+def test_load_minute_bars_for_vix(tmp_path, monkeypatch):
+    monkeypatch.setattr(volsurf.data, "_FROZEN", tmp_path)
+    monkeypatch.setattr(volsurf.data, "_MANIFEST", tmp_path / "manifest.json")
+    tickers = _RecordingTickers({"^VIX": _vix_bars()})
+    monkeypatch.setattr(yfinance, "Ticker", tickers)
+
+    bars = load_minute_bars("2026-09-30", ticker="^VIX")
+    assert tickers.symbols == ["^VIX"]
+    assert tickers.fakes["^VIX"].calls == [
+        {"start": "2026-09-30", "end": "2026-10-01", "interval": "1m", "auto_adjust": False}
+    ]
+    assert (tmp_path / "vix_1m_20260930.parquet").exists() and not (tmp_path / "spy_1m_20260930.parquet").exists()
+    # Every bar is kept, 03:15 to 16:14 in New York, on bar starts in UTC.
+    assert len(bars) == 780 and bars.index.name == "bar_start" and str(bars.index.tz) == "UTC"
+    assert bars.index[0] == pd.Timestamp("2026-09-30 07:15", tz="UTC")
+    assert bars.index[-1] == pd.Timestamp("2026-09-30 20:14", tz="UTC")
+    entry = json.loads((tmp_path / "manifest.json").read_text())["minute_bars"]["vix_1m_20260930.parquet"]
+    assert entry["ticker"] == "^VIX" and entry["row_count"] == 780 and entry["date"] == "2026-09-30"
+    assert entry["first_bar"] == "2026-09-30T07:15:00+00:00" and entry["last_bar"] == "2026-09-30T20:14:00+00:00"
+
+    monkeypatch.setattr(yfinance, "Ticker", _no_network)
+    pd.testing.assert_frame_equal(load_minute_bars("2026-09-30", ticker="^VIX"), bars)  # the frozen file
+    monkeypatch.setattr(yfinance, "Ticker", lambda ticker: _FakeTicker(_vix_bars().iloc[:0]))
+    with pytest.raises(NoBarsError, match=r"no \^VIX 1-minute bars for 2026-10-01"):
+        load_minute_bars("2026-10-01", ticker="^VIX")
+    assert issubclass(NoBarsError, ValueError)
+
+
+def test_snapshot_vix_bar(tmp_path, monkeypatch):
+    frozen, raw_dir, snapshot, _ = _spot_bar_setup(tmp_path, monkeypatch)
+    tickers = _RecordingTickers({"^VIX": _vix_bars()})
+    monkeypatch.setattr(yfinance, "Ticker", tickers)
+    vix = snapshot_vix_bar(snapshot.name)
+    assert tickers.symbols == ["^VIX"] and (frozen / "vix_1m_20260930.parquet").exists()
+    # The quote time is 19:05:42 UTC, 15:05:42 in New York: the 15:05 bar, 710 minutes after 03:15.
+    assert vix == {
+        "close": _vix_bars()["Close"].to_numpy()[710],
+        "source": "1-minute bar",
+        "target_utc": "2026-09-30T19:05:42+00:00",
+        "bar_start": "2026-09-30T19:05:00+00:00",
+        "bar_end": "2026-09-30T19:06:00+00:00",
+        "bars": "vix_1m_20260930.parquet",
+    }
+    entry = json.loads((frozen / "manifest.json").read_text())["chains"]["chain_20260930.parquet"]
+    assert entry["vix_bar"] == vix and entry["snapshot"] == snapshot.name  # the rest of the entry is kept
+
+    # A second read uses the frozen bars and leaves the manifest as it is.
+    monkeypatch.setattr(yfinance, "Ticker", _no_network)
+    text = (frozen / "manifest.json").read_text()
+    (frozen / "manifest.json").write_text(text + "\n")  # a marker that a rewrite would drop
+    assert snapshot_vix_bar(snapshot) == vix
+    assert (frozen / "manifest.json").read_text() == text + "\n"
+
+
+def test_snapshot_vix_bar_falls_back_to_the_daily_close(tmp_path, monkeypatch):
+    frozen, raw_dir, snapshot, _ = _spot_bar_setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(yfinance, "Ticker", lambda ticker: _FakeTicker(_vix_bars().iloc[:0]))  # Yahoo has no bars
+    downloads = []
+
+    def _download(ticker, **kwargs):
+        downloads.append((ticker, kwargs["start"], kwargs["end"]))
+        index = pd.DatetimeIndex(["2026-09-30"], name="Date")
+        return pd.DataFrame({"Open": [16.0], "Close": [16.52]}, index=index)
+
+    monkeypatch.setattr(yfinance, "download", _download)
+    vix = snapshot_vix_bar(snapshot.name)
+    assert downloads == [("^VIX", "2026-09-30", "2026-10-01")]
+    assert vix == {"close": 16.52, "source": "daily close", "target_utc": "2026-09-30T19:05:42+00:00",
+                   "date": "2026-09-30"}
+    entry = json.loads((frozen / "manifest.json").read_text())["chains"]["chain_20260930.parquet"]
+    assert entry["vix_bar"] == vix
+
+    # While no bars are frozen, the recorded close is reused without a download.
+    monkeypatch.setattr(yfinance, "Ticker", _no_network)
+    monkeypatch.setattr(yfinance, "download", _no_network)
+    assert snapshot_vix_bar(snapshot.name) == vix
+
+    # Once bars are frozen, the 1-minute bar replaces the fallback.
+    bars = _vix_bars()
+    bars.index = bars.index.tz_convert("UTC").rename("bar_start")
+    bars[["Open", "High", "Low", "Close", "Volume"]].to_parquet(frozen / "vix_1m_20260930.parquet")
+    vix = snapshot_vix_bar(snapshot.name)
+    assert vix["source"] == "1-minute bar" and vix["close"] == bars["Close"].to_numpy()[710]
+    entry = json.loads((frozen / "manifest.json").read_text())["chains"]["chain_20260930.parquet"]
+    assert entry["vix_bar"] == vix
+
+    # Without bars or a daily close, it raises.
+    (frozen / "vix_1m_20260930.parquet").unlink()
+    monkeypatch.setattr(yfinance, "Ticker", lambda ticker: _FakeTicker(_vix_bars().iloc[:0]))
+    monkeypatch.setattr(yfinance, "download", lambda ticker, **kwargs: pd.DataFrame({"Close": []}))
+    with pytest.raises(ValueError, match=r"no \^VIX daily close for 2026-09-30"):
+        snapshot_vix_bar(snapshot.name)
+
+
+def test_frozen_vix_bars():
+    bars = pd.read_parquet(FROZEN_VIX_BARS)
+    manifest = json.loads(FROZEN_MANIFEST.read_text())
+    meta = manifest["minute_bars"][FROZEN_VIX_BARS.name]
+    assert meta["ticker"] == "^VIX" and len(bars) == meta["row_count"]
+    assert bars.index.is_unique and bars.index.is_monotonic_increasing
+    days = bars.index.tz_convert("America/New_York").normalize().tz_localize(None)
+    assert (days == pd.Timestamp("2026-09-30")).all()
+    quote_time = pd.read_parquet(FROZEN_CHAIN)["lastTradeDate"].max()
+    entry = manifest["chains"][FROZEN_CHAIN.name]
+    assert entry["vix_bar"]["target_utc"] == entry["spot_bar"]["target_utc"] == quote_time.isoformat()
+    bar = nearest_bar_close(bars, quote_time)
+    assert entry["vix_bar"]["source"] == "1-minute bar" and entry["vix_bar"]["bars"] == FROZEN_VIX_BARS.name
+    assert entry["vix_bar"]["close"] == bar["close"]
+    assert entry["vix_bar"]["bar_start"] == bar["bar_start"].isoformat()
+    assert abs(bar["bar_end"] - quote_time) <= pd.Timedelta(seconds=30)
 
 UST_SERIES = ["DGS1MO", "DGS3MO", "DGS6MO", "DGS1", "DGS2", "DGS3"]
 UST_TENORS = np.array([1 / 12, 0.25, 0.5, 1.0, 2.0, 3.0])
