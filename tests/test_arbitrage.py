@@ -19,6 +19,7 @@ from volsurf.arbitrage import (
     _margin_minimisers,
     arbitrage_table,
     bracket,
+    bridge_30d,
     butterfly_g,
     interpolate_w,
     k_grid,
@@ -27,10 +28,12 @@ from volsurf.arbitrage import (
     refit_slice,
     refit_surface,
     svi_density,
+    surface_from_chain,
     svi_derivatives,
     variance_swap_replication,
     variance_swap_z_integral,
     violation_counts,
+    vix_cell_range,
     vix_discrete_variance,
 )
 from volsurf.black_scholes import black76_price
@@ -38,6 +41,7 @@ from volsurf.implied_vol import black76_implied_vol
 from volsurf.svi import fit_svi, raw_svi, svi_constraints, svi_fit_errors, svi_objective, vega_weights
 
 FROZEN_CHAIN = pathlib.Path(__file__).resolve().parents[1] / "data" / "frozen" / "chain_20260930.parquet"
+FROZEN_CHAINS = ["chain_20260930.parquet", "chain_20261001.parquet", "chain_20261002.parquet"]  # every snapshot
 NEAR_TARGET = 1.0  # DESIGN section 8: near-the-money RMSE under 1 vol point on every slice after the refit
 CONSTRAINT_TOL = 1e-12  # DESIGN section 7: Stage 3 constraints after the conversion to raw parameters
 CROSS_CHECK_TOL = 1e-10  # DESIGN section 8: no restart may beat the refit by more on f
@@ -306,21 +310,41 @@ def frozen_surface():
             "refits": refit_surface(quotes, fits)}
 
 
-def test_frozen_refit(frozen_surface):
-    # DESIGN section 8 acceptance on the 2026-09-30 snapshot: after the refit, no violation on the
+@pytest.fixture(scope="module", params=FROZEN_CHAINS)
+def snapshot_surface(request):
+    """The surface of each frozen snapshot, from surface_from_chain: (chain file name, Surface)."""
+    return request.param, surface_from_chain(pd.read_parquet(FROZEN_CHAIN.with_name(request.param)))
+
+
+def test_surface_from_chain_matches_the_notebook_path(frozen_surface):
+    # On 2026-09-30, the pipeline function reproduces the steps of the notebook's surface sections, which
+    # the frozen_surface fixture follows: the same quotes, Stage 3 fits and refits.
+    surface = surface_from_chain(pd.read_parquet(FROZEN_CHAIN))
+    assert surface.expiries == frozen_surface["expiries"]
+    np.testing.assert_array_equal(surface.T, frozen_surface["T"])
+    for mine, theirs in zip(surface.quotes, frozen_surface["quotes"]):
+        for a, b in zip(mine, theirs):
+            np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+    assert surface.ranges == [(k.min(), k.max()) for k, _, _ in frozen_surface["quotes"]]
+    assert surface.fits == frozen_surface["fits"]
+    assert [r.fit for r in surface.refits] == [r.fit for r in frozen_surface["refits"]]
+
+
+def test_frozen_refit(snapshot_surface):
+    # DESIGN section 8 acceptance on every frozen snapshot: after the refit, no violation on the
     # certification grid in either region, the Stage 3 constraints, m in the quoted range, and
     # near-the-money RMSE under 1 vol point on every slice.
-    quotes, refits = frozen_surface["quotes"], frozen_surface["refits"]
-    assert len(refits) == 12
-    params = [r.fit[:5] for r in refits]
-    ranges = [(k.min(), k.max()) for k, _, _ in quotes]
-    table = arbitrage_table(params, ranges, k_grid(N_CERTIFY))
+    name, surface = snapshot_surface
+    assert len(surface.refits) == 12
+    params = [r.fit[:5] for r in surface.refits]
+    table = arbitrage_table(params, surface.ranges, k_grid(N_CERTIFY))
     counts = ["butterfly quoted", "butterfly extrapolated", "calendar quoted", "calendar extrapolated"]
+    print(name)
     print(table.to_string())
     assert (table[counts].fillna(0) == 0).all(axis=None)
     cert = k_grid(N_CERTIFY)
     for expiry, (k, w, weights), T, result, previous in zip(
-        frozen_surface["expiries"], quotes, frozen_surface["T"], refits, [None, *params[:-1]]
+        surface.expiries, surface.quotes, surface.T, surface.refits, [None, *params[:-1]]
     ):
         _assert_clean(result.fit, k, previous)
         errors = svi_fit_errors(k, w, T, result.fit)
@@ -333,11 +357,12 @@ def test_frozen_refit(frozen_surface):
         assert not np.isin(result.added[~on_fine], cert).any()
 
 
-def test_frozen_refit_restarts(frozen_surface):
-    # DESIGN section 8 cross-check: the refit repeated from the nine Stage 3 outer starts never beats the
-    # chosen refit by more than 1e-10 on f.
+def test_frozen_refit_restarts(snapshot_surface):
+    # DESIGN section 8 cross-check on every frozen snapshot: the refit repeated from the nine Stage 3 outer
+    # starts never beats the chosen refit by more than 1e-10 on f.
+    _, surface = snapshot_surface
     previous = None
-    for (k, w, weights), result in zip(frozen_surface["quotes"], frozen_surface["refits"]):
+    for (k, w, weights), result in zip(surface.quotes, surface.refits):
         solved = [r for r in refit_restarts(k, w, weights, previous) if r is not None]
         assert solved
         assert min(r.fit.objective for r in solved) >= result.fit.objective - CROSS_CHECK_TOL
@@ -347,7 +372,7 @@ def test_frozen_refit_restarts(frozen_surface):
 # DESIGN section 8 (verified): the test slice's variance-swap vol, 14.9647% by replication and by Gatheral's
 # z-integral, against ATM 13.6770%; printed to 4 decimals in percent, so each holds to 5e-7 in vol.
 DESIGN_VS, DESIGN_ATM, PRINTED_HALF_UNIT = 0.149647, 0.136770, 5e-7
-VIX_CHECK_TOL = 1e-4  # DESIGN section 8: the discrete formula agrees with the replication within 0.01 vol points
+VIX_CHECK_TOL = 1e-4  # DESIGN section 8: the discrete formula agrees with the replication over its cells within 0.01 vol points
 
 
 def _design_w(k):
@@ -483,29 +508,62 @@ def test_vix_discrete_variance():
         vix_discrete_variance([0.01, 0.02], flat)
 
 
-def test_frozen_bridge(frozen_surface):
-    # DESIGN section 8 on the 2026-09-30 snapshot: the 30-day slice from the refitted bracketing expiries,
-    # over the intersection of their quoted ranges. The CBOE discrete formula at the quoted strikes of both
-    # expiries agrees with the replication within 0.01 vol points; the truncated value lies below the
-    # full-range one, and the full range agrees by replication and by the z-integral.
+def test_vix_cell_range():
+    # Nodes at K/F = 0.9, 1.0, 1.05: the end cells reach half a step out, to 0.85 and 1.075.
+    k_lo, k_hi = vix_cell_range(np.log([1.05, 0.9, 1.0, 1.0]))
+    assert (k_lo, k_hi) == (pytest.approx(math.log(0.85), rel=1e-14), pytest.approx(math.log(1.075), rel=1e-14))
+    # On the DESIGN slice the discrete formula is closer to the replication over its own cells than over
+    # the range of its nodes, and that gap shrinks as the strikes get denser.
+    quoted = math.sqrt(variance_swap_replication(_design_w, -0.3, 0.1) / DESIGN_T)
+    gaps = []
+    for step in (1e-3, 1e-4):
+        nodes = np.linspace(-0.3, 0.1, round(0.4 / step) + 1)
+        discrete = math.sqrt(vix_discrete_variance(nodes, _design_w) / DESIGN_T)
+        cells = math.sqrt(variance_swap_replication(_design_w, *vix_cell_range(nodes)) / DESIGN_T)
+        print(f"strike step {step:g}: discrete minus replication over its cells {discrete - cells:+.2e}, over "
+              f"the range of its nodes {discrete - quoted:+.2e} in vol")
+        assert abs(discrete - cells) < abs(discrete - quoted)
+        gaps.append(abs(discrete - cells))
+    assert gaps[0] <= VIX_CHECK_TOL and gaps[1] <= 1e-6 and gaps[1] < gaps[0] / 10
+    with pytest.raises(ValueError, match="two distinct nodes"):
+        vix_cell_range([0.0, 0.0])
+
+
+def test_bridge_30d_matches_the_notebook_path(frozen_surface):
+    # On 2026-09-30, bridge_30d computes what the notebook's bridge cell computes, step by step.
     T, quotes = frozen_surface["T"], frozen_surface["quotes"]
     params = [r.fit[:5] for r in frozen_surface["refits"]]
     i, j, lam = bracket(T_BRIDGE, T)
-    assert [f"{frozen_surface['expiries'][n]:%Y-%m-%d}" for n in (i, j)] == ["2026-10-16", "2026-11-20"]
     k_lo, k_hi = max(quotes[i][0].min(), quotes[j][0].min()), min(quotes[i][0].max(), quotes[j][0].max())
 
     def w30(k):
         return interpolate_w(k, T_BRIDGE, T, params)
 
-    truncated = variance_swap_replication(w30, k_lo, k_hi)
     nodes = np.concatenate([quotes[n][0] for n in (i, j)])
-    nodes = nodes[(nodes >= k_lo) & (nodes <= k_hi)]
-    discrete = vix_discrete_variance(nodes, w30)
-    vol, vol_discrete = math.sqrt(truncated / T_BRIDGE), math.sqrt(discrete / T_BRIDGE)
-    full = variance_swap_replication(w30)
-    print(f"30-day slice, lam = {lam:.4f}, k in [{k_lo:.4f}, {k_hi:.4f}], {np.unique(nodes).size} strikes: "
-          f"discrete minus replication {100 * (vol_discrete - vol):+.4f} vol points")
-    assert abs(vol_discrete - vol) <= VIX_CHECK_TOL
-    assert truncated < full
-    assert math.sqrt(full / T_BRIDGE) == pytest.approx(math.sqrt(variance_swap_z_integral(w30) / T_BRIDGE),
-                                                       rel=1e-8)
+    nodes = np.unique(nodes[(nodes >= k_lo) & (nodes <= k_hi)])
+    bridge = bridge_30d(surface_from_chain(pd.read_parquet(FROZEN_CHAIN)))
+    assert (bridge.i, bridge.j, bridge.lam, bridge.k_lo, bridge.k_hi, bridge.n_strikes) == (i, j, lam, k_lo, k_hi,
+                                                                                         nodes.size)
+    assert bridge.sigma_vs == math.sqrt(variance_swap_replication(w30, k_lo, k_hi) / T_BRIDGE)
+    assert bridge.sigma_vs_discrete == math.sqrt(vix_discrete_variance(nodes, w30) / T_BRIDGE)
+    assert bridge.sigma_atm == math.sqrt(float(w30(0.0)) / T_BRIDGE)
+    assert bridge.gap == bridge.sigma_vs - bridge.sigma_atm
+
+
+def test_frozen_bridge(snapshot_surface):
+    # DESIGN section 8 on every frozen snapshot: the 30-day slice from the refitted bracketing expiries,
+    # over the intersection of their quoted ranges. The CBOE discrete formula at the quoted strikes of both
+    # expiries agrees within 0.01 vol points with the replication over the range its cells cover; the
+    # truncated value lies below the full-range one, and the full range agrees by replication and by the
+    # z-integral.
+    name, surface = snapshot_surface
+    bridge = bridge_30d(surface)
+    assert [f"{surface.expiries[n]:%Y-%m-%d}" for n in (bridge.i, bridge.j)] == ["2026-10-16", "2026-11-20"]
+    print(f"{name}: lam = {bridge.lam:.4f}, k in [{bridge.k_lo:.4f}, {bridge.k_hi:.4f}], {bridge.n_strikes} "
+          f"strikes: discrete minus replication over its cells {100 * (bridge.sigma_vs_discrete - bridge.sigma_vs_cells):+.5f}, "
+          f"over the quoted range {100 * (bridge.sigma_vs_discrete - bridge.sigma_vs):+.4f} vol points")
+    assert abs(bridge.sigma_vs_discrete - bridge.sigma_vs_cells) <= VIX_CHECK_TOL
+    assert bridge.sigma_vs < bridge.sigma_vs_cells  # the cells reach beyond the quoted range
+    assert bridge.sigma_vs < bridge.sigma_vs_full
+    assert bridge.sigma_vs_full == pytest.approx(bridge.sigma_vs_full_z, rel=1e-8)
+    assert bridge.gap == bridge.sigma_vs - bridge.sigma_atm and bridge.gap > 0

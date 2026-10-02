@@ -21,6 +21,7 @@ from volsurf.svi import (
 )
 
 FROZEN_CHAIN = pathlib.Path(__file__).resolve().parents[1] / "data" / "frozen" / "chain_20260930.parquet"
+FROZEN_CHAINS = ["chain_20260930.parquet", "chain_20261001.parquet", "chain_20261002.parquet"]  # every snapshot
 NEAR_TARGET = 1.0  # DESIGN section 7: near-the-money RMSE under 1 vol point on every slice
 CONSTRAINT_TOL = 1e-12  # DESIGN section 7: constraints hold to 1e-12 after the conversion to raw parameters
 BOUND_TOL = 1e-8  # DESIGN section 7: m on its bound, or |rho| on 1, to this tolerance
@@ -247,11 +248,12 @@ def test_svi_fit_errors():
         svi_fit_errors(k[:2], w[:2], 1.0, flat)
 
 
-def test_frozen_svi_fits():
-    # DESIGN section 7 on the 2026-09-30 snapshot: every slice of the frozen chain, fitted from its kept
+@pytest.mark.parametrize("chain_name", FROZEN_CHAINS)
+def test_frozen_svi_fits(chain_name):
+    # DESIGN section 7 on every frozen snapshot: every slice of the frozen chain, fitted from its kept
     # quotes with an implied vol, satisfies the constraints with m inside its quoted range, passes the
     # direct cross-check and fits within 1 vol point RMSE near the money.
-    chain = pd.read_parquet(FROZEN_CHAIN)
+    chain = pd.read_parquet(FROZEN_CHAIN.with_name(chain_name))
     kept = chain[chain["status"] == "kept"].copy()
     kept["iv"] = black76_implied_vol(
         kept["mid"], kept["F"], kept["strike"], kept["T"], kept["D"], kept["option_type"] == "call"

@@ -26,6 +26,10 @@ cross-checked by Gatheral's z-integral over the full range and by the CBOE
 discrete formula over quoted strikes. A 30-day slice comes from linear
 interpolation of w in T at fixed k between the bracketing expiries.
 
+surface_from_chain runs the whole surface track on one cleaned chain, and
+bridge_30d the bridge on its result, for the stability check across
+snapshots.
+
 Units: k and w are dimensionless (w is a decimal variance times years), T
 is in years and implied vols are decimals.
 """
@@ -40,6 +44,7 @@ from scipy.optimize import brentq, minimize, minimize_scalar
 from scipy.stats import norm
 
 from volsurf.black_scholes import black76_price
+from volsurf.implied_vol import black76_implied_vol
 from volsurf.svi import (
     S_MIN,
     SVIFit,
@@ -47,10 +52,12 @@ from volsurf.svi import (
     _project_inner,
     _raw_from_inner,
     _slice_arrays,
+    fit_svi,
     outer_starts,
     quasi_explicit_inner,
     raw_svi,
     svi_objective,
+    vega_weights,
 )
 
 K_RANGE = (-2.0, 1.0)  # log-moneyness range of every check
@@ -767,3 +774,180 @@ def vix_discrete_variance(k_nodes, w):
     dx[0], dx[-1] = x[1] - x[0], x[-1] - x[-2]
     dx[1:-1] = 0.5 * (x[2:] - x[:-2])
     return float(2.0 * np.sum(dx / x**2 * q) - (1.0 / x[i0] - 1.0) ** 2)
+
+
+def vix_cell_range(k_nodes):
+    """The range of k that the cells of vix_discrete_variance cover.
+
+    Each node's weight Δx is the width of its cell. The end nodes get the
+    full distance to their one neighbour, so with nodes x_1 < ... < x_n
+    (x = e^k) the cells run from x_1 - (x_2 - x_1)/2 to x_n + (x_n - x_{n-1})/2,
+    half a strike step beyond each end strike. The replication over this
+    range is the like-for-like cross-check of the discrete formula.
+
+    Parameters
+    ----------
+    k_nodes : array_like
+        Log-moneyness of the strikes, at least two distinct; duplicates are
+        dropped.
+
+    Returns
+    -------
+    k_lo, k_hi : float
+        The ends of the cells in log-moneyness.
+
+    Raises
+    ------
+    ValueError
+        With fewer than two distinct nodes.
+    """
+    x = np.unique(np.exp(np.asarray(k_nodes, dtype=float)))
+    if x.size < 2:
+        raise ValueError("the cells need two distinct nodes")
+    return math.log(x[0] - 0.5 * (x[1] - x[0])), math.log(x[-1] + 0.5 * (x[-1] - x[-2]))
+
+
+class Surface(NamedTuple):
+    """The Stage 2c to 4 surface of one cleaned chain (surface_from_chain).
+
+    expiries : list of pd.Timestamp
+        The expiries, in increasing order of T.
+    T : ndarray
+        Time to expiry of each slice in years.
+    quotes : list of (k, w, weights)
+        Each slice's kept quotes with an implied vol, sorted by k: log-moneyness,
+        market total variance and Black-76 vega weights summing to 1.
+    ranges : list of (k_lo, k_hi)
+        Each slice's quoted range of k.
+    fits : list of SVIFit
+        The Stage 3 fits.
+    refits : list of RefitResult
+        The Stage 4 constrained refit, slice by slice.
+    """
+
+    expiries: list
+    T: np.ndarray
+    quotes: list
+    ranges: list
+    fits: list
+    refits: list
+
+
+class Bridge(NamedTuple):
+    """The 30-day variance-swap bridge of a surface (bridge_30d); vols as decimals.
+
+    i, j, lam : the bracketing slices and the weight of the later one (bracket).
+    k_lo, k_hi : the integration range, inside both slices' quoted ranges.
+    n_strikes : distinct quoted strikes of both slices inside the range.
+    sigma_vs : variance-swap vol by replication over the range.
+    sigma_vs_discrete : the CBOE discrete formula on the same slice at those strikes.
+    sigma_vs_cells : replication over the range the formula's cells cover (vix_cell_range),
+        its cross-check.
+    sigma_vs_cboe : the CBOE order, the formula on each slice's own quoted strikes in
+        the range, then σ²T linear in T (information only).
+    sigma_atm : ATM vol √(w(0)/T) of the slice.
+    gap : sigma_vs - sigma_atm.
+    sigma_vs_full, sigma_vs_full_z : the full-range variance-swap vol by replication
+        and by Gatheral's z-integral (the sensitivity).
+    """
+
+    i: int
+    j: int
+    lam: float
+    k_lo: float
+    k_hi: float
+    n_strikes: int
+    sigma_vs: float
+    sigma_vs_discrete: float
+    sigma_vs_cells: float
+    sigma_vs_cboe: float
+    sigma_atm: float
+    gap: float
+    sigma_vs_full: float
+    sigma_vs_full_z: float
+
+
+def surface_from_chain(chain):
+    """Stages 2c to 4 on one cleaned chain: implied vols, Stage 3 SVI fits and the constrained refit.
+
+    The same steps as the notebook's surface sections. Every contract with
+    status kept is solved for its Black-76 implied vol at the mid with its
+    expiry's F, D and T, and those without one are left out (the no-IV
+    filter). Each expiry's remaining quotes, sorted by k, give w = σ²T and
+    vega weights; fit_svi fits them, and refit_surface refits the slices in
+    order of T.
+
+    Parameters
+    ----------
+    chain : pd.DataFrame
+        A cleaned chain (data.clean_chain or data.load_chain).
+
+    Returns
+    -------
+    Surface
+    """
+    kept = chain[chain["status"] == "kept"]
+    kept = kept.assign(iv=black76_implied_vol(
+        kept["mid"], kept["F"], kept["strike"], kept["T"], kept["D"], kept["option_type"] == "call"
+    )).dropna(subset=["iv"])
+    expiries, T, quotes, fits = [], [], [], []
+    for expiry, rows in kept.groupby("expiry"):
+        rows = rows.sort_values("k")
+        k, w = rows["k"].to_numpy(), (rows["iv"] ** 2 * rows["T"]).to_numpy()
+        weights = vega_weights(rows["F"], rows["strike"], rows["T"], rows["D"], rows["iv"])
+        expiries.append(expiry)
+        T.append(float(rows["T"].iloc[0]))
+        quotes.append((k, w, weights))
+        fits.append(fit_svi(k, w, weights))
+    ranges = [(float(k.min()), float(k.max())) for k, _, _ in quotes]
+    return Surface(expiries, np.array(T), quotes, ranges, fits, refit_surface(quotes, fits))
+
+
+def bridge_30d(surface, T=T_BRIDGE):
+    """The variance-swap bridge of a surface at T (DESIGN.md section 8), from its refitted slices.
+
+    The slice at T is linear in T at fixed k between the bracketing refits
+    (interpolate_w), over the intersection of their quoted ranges. The
+    variance-swap vol comes by replication over that range. The CBOE discrete
+    formula on the same slice at the quoted strikes of both expiries is
+    cross-checked against the replication over the range its cells cover
+    (vix_cell_range), and the CBOE order is computed for information. The full
+    range by replication and by the z-integral is the sensitivity.
+
+    Parameters
+    ----------
+    surface : Surface
+        From surface_from_chain.
+    T : float, default 30/365
+        Maturity of the bridge in years.
+
+    Returns
+    -------
+    Bridge
+    """
+    params = [result.fit[:5] for result in surface.refits]
+    i, j, lam = bracket(T, surface.T)
+    k_lo, k_hi = max(surface.ranges[i][0], surface.ranges[j][0]), min(surface.ranges[i][1], surface.ranges[j][1])
+
+    def w_at(k):
+        return interpolate_w(k, T, surface.T, params)
+
+    def in_range(k):
+        return k[(k >= k_lo) & (k <= k_hi)]
+
+    nodes = np.unique(np.concatenate([in_range(surface.quotes[n][0]) for n in (i, j)]))
+    per_expiry = [vix_discrete_variance(in_range(surface.quotes[n][0]), lambda k, p=params[n]: raw_svi(k, *p))
+                  for n in (i, j)]
+    sigma_vs = math.sqrt(variance_swap_replication(w_at, k_lo, k_hi) / T)
+    sigma_atm = math.sqrt(float(w_at(0.0)) / T)
+    return Bridge(
+        i, j, lam, k_lo, k_hi, int(nodes.size),
+        sigma_vs,
+        math.sqrt(vix_discrete_variance(nodes, w_at) / T),
+        math.sqrt(variance_swap_replication(w_at, *vix_cell_range(nodes)) / T),
+        math.sqrt(((1.0 - lam) * per_expiry[0] + lam * per_expiry[1]) / T),
+        sigma_atm,
+        sigma_vs - sigma_atm,
+        math.sqrt(variance_swap_replication(w_at) / T),
+        math.sqrt(variance_swap_z_integral(w_at) / T),
+    )
