@@ -88,3 +88,19 @@ def test_outputs_hold_no_optionmetrics_iv():
         if np.any(nearest <= 1e-6):
             hits.append(cell.get("id"))
     assert not hits, f"outputs of cells {hits} print a number equal to a daily OptionMetrics IV to 1e-6"
+
+
+def test_surface_sections_use_the_primary():
+    # DESIGN section 5: the surface sections run on the primary snapshot. SNAPSHOT names the snapshot the
+    # rule picks from the frozen chains, and the stability section's computed line confirms it.
+    frozen = pathlib.Path(volsurf.data.__file__).resolve().parents[2] / "data" / "frozen"
+    eligible = {"spy_chain_20261001T151531Z.parquet": "chain_20261001.parquet",
+                "spy_chain_20261002T151346Z.parquet": "chain_20261002.parquet"}
+    spreads = {raw: volsurf.data.near_money_spread(pd.read_parquet(frozen / chain)) for raw, chain in eligible.items()}
+    primary = volsurf.data.primary_snapshot(spreads)
+    cells = {cell.get("id"): cell for cell in _cells()}
+    snapshot = re.search(r'SNAPSHOT = ROOT / "data" / "raw" / "(spy_chain_\w+\.parquet)"',
+                         "".join(cells["stage-2b-setup"]["source"]))
+    assert snapshot is not None and snapshot.group(1) == primary
+    printed = "\n".join(_output_texts(cells["stability-table"]))
+    assert f"the primary is {primary}" in printed and "it is the rule's primary: True" in printed

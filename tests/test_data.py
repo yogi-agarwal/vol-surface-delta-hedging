@@ -1088,13 +1088,15 @@ def test_frozen_rate_choice(history):
     assert (chain["rate"] == history.loc["2026-09-29", "r"]).all()
 
 
-def test_frozen_treasury_curve():
-    curve = pd.read_csv(FROZEN_CURVE, index_col="date", parse_dates=["date"])
-    entry = json.loads(FROZEN_MANIFEST.read_text())["curves"][FROZEN_CURVE.name]
+@pytest.mark.parametrize("snapshot_date", ["2026-09-30", "2026-10-02"])  # the curves of the primary snapshots
+def test_frozen_treasury_curve(snapshot_date):
+    path = FROZEN_CURVE.with_name(f"ust_curve_{snapshot_date.replace('-', '')}.csv")
+    curve = pd.read_csv(path, index_col="date", parse_dates=["date"])
+    entry = json.loads(FROZEN_MANIFEST.read_text())["curves"][path.name]
     assert curve.columns.tolist() == UST_SERIES and len(curve) == entry["row_count"]
     assert curve.index.is_unique and curve.index.is_monotonic_increasing
-    assert curve.index.max() <= pd.Timestamp("2026-09-30")
-    curve_date, tenors, rates = treasury_rates(curve, "2026-09-30")
+    assert curve.index.max() <= pd.Timestamp(snapshot_date)
+    curve_date, tenors, rates = treasury_rates(curve, snapshot_date)
     assert str(curve_date.date()) == entry["curve_date"]
     np.testing.assert_allclose(tenors, UST_TENORS, rtol=0, atol=0)
     assert ((rates > 0) & (rates < 0.1)).all()
