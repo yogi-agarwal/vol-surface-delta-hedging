@@ -63,6 +63,106 @@
         "bar_end": "2026-09-30T19:06:00+00:00",
         "bars": "vix_1m_20260930.parquet"
       }
+    },
+    "chain_20261001.parquet": {
+      "utc_timestamp": "2026-10-02T15:32:30.416599+00:00",
+      "snapshot": "spy_chain_20261001T151531Z.parquet",
+      "ticker": "SPY",
+      "yfinance_version": "1.7.0",
+      "fetch_utc_first": "2026-10-01T15:15:31.845720+00:00",
+      "fetch_utc_last": "2026-10-01T15:15:48.912535+00:00",
+      "spot": 760.1599731445312,
+      "rate": 0.04106926650888987,
+      "rate_date": "2026-09-30",
+      "expiries": [
+        "2026-10-16",
+        "2026-11-20",
+        "2026-12-18",
+        "2027-01-15",
+        "2027-03-19",
+        "2027-06-17",
+        "2027-09-17",
+        "2027-12-17",
+        "2028-01-21",
+        "2028-06-16",
+        "2028-12-15",
+        "2029-01-19"
+      ],
+      "raw_rows": 9215,
+      "row_count": 4625,
+      "kept": 2232,
+      "spot_bar": {
+        "close": 760.4099731445312,
+        "bar_start": "2026-10-01T14:59:00+00:00",
+        "bar_end": "2026-10-01T15:00:00+00:00",
+        "target_utc": "2026-10-01T15:00:22+00:00",
+        "bars": "spy_1m_20261001T151531Z.parquet"
+      },
+      "spot_bar_fetch": {
+        "close": 760.405029296875,
+        "bar_start": "2026-10-01T15:15:00+00:00",
+        "bar_end": "2026-10-01T15:16:00+00:00",
+        "target_utc": "2026-10-01T15:15:31.845720+00:00",
+        "bars": "spy_1m_20261001T151531Z.parquet"
+      },
+      "vix_bar": {
+        "close": 17.3700008392334,
+        "source": "1-minute bar",
+        "target_utc": "2026-10-01T15:00:22+00:00",
+        "bar_start": "2026-10-01T14:59:00+00:00",
+        "bar_end": "2026-10-01T15:00:00+00:00",
+        "bars": "vix_1m_20261001.parquet"
+      }
+    },
+    "chain_20261002.parquet": {
+      "utc_timestamp": "2026-10-02T15:32:30.546502+00:00",
+      "snapshot": "spy_chain_20261002T151346Z.parquet",
+      "ticker": "SPY",
+      "yfinance_version": "1.7.0",
+      "fetch_utc_first": "2026-10-02T15:13:46.430475+00:00",
+      "fetch_utc_last": "2026-10-02T15:14:02.236303+00:00",
+      "spot": 768.5349731445312,
+      "rate": 0.04057762030916862,
+      "rate_date": "2026-10-01",
+      "expiries": [
+        "2026-10-16",
+        "2026-11-20",
+        "2026-12-18",
+        "2027-01-15",
+        "2027-03-19",
+        "2027-06-17",
+        "2027-09-17",
+        "2027-12-17",
+        "2028-01-21",
+        "2028-06-16",
+        "2028-12-15",
+        "2029-01-19"
+      ],
+      "raw_rows": 8959,
+      "row_count": 4625,
+      "kept": 2237,
+      "spot_bar": {
+        "close": 771.0,
+        "bar_start": "2026-10-02T14:58:00+00:00",
+        "bar_end": "2026-10-02T14:59:00+00:00",
+        "target_utc": "2026-10-02T14:58:41+00:00",
+        "bars": "spy_1m_20261002T151346Z.parquet"
+      },
+      "spot_bar_fetch": {
+        "close": 768.6900024414062,
+        "bar_start": "2026-10-02T15:13:00+00:00",
+        "bar_end": "2026-10-02T15:14:00+00:00",
+        "target_utc": "2026-10-02T15:13:46.430475+00:00",
+        "bars": "spy_1m_20261002T151346Z.parquet"
+      },
+      "vix_bar": {
+        "close": 15.529999732971191,
+        "source": "1-minute bar",
+        "target_utc": "2026-10-02T14:58:41+00:00",
+        "bar_start": "2026-10-02T14:58:00+00:00",
+        "bar_end": "2026-10-02T14:59:00+00:00",
+        "bars": "vix_1m_20261002.parquet"
+      }
     }
   },
   "minute_bars": {
@@ -87,6 +187,52 @@
       "first_bar": "2026-09-30T07:15:00+00:00",
       "last_bar": "2026-09-30T20:14:00+00:00",
       "row_count": 775
+    },
+    "vix_1m_20261001.parquet": {
+      "utc_timestamp": "2026-10-02T15:26:29.509966+00:00",
+      "ticker": "^VIX",
+      "yfinance_version": "1.7.0",
+      "interval": "1m",
+      "auto_adjust": false,
+      "date": "2026-10-01",
+      "first_bar": "2026-10-01T07:15:00+00:00",
+      "last_bar": "2026-10-01T20:14:00+00:00",
+      "row_count": 775
+    },
+    "vix_1m_20261002.parquet": {
+      "utc_timestamp": "2026-10-02T15:26:29.610443+00:00",
+      "ticker": "^VIX",
+      "yfinance_version": "1.7.0",
+      "interval": "1m",
+      "auto_adjust": false,
+      "date": "2026-10-02",
+      "first_bar": "2026-10-02T07:15:00+00:00",
+      "last_bar": "2026-10-02T15:11:00+00:00",
+      "row_count": 472
+    },
+    "spy_1m_20261001T151531Z.parquet": {
+      "utc_timestamp": "2026-10-02T15:32:30.336572+00:00",
+      "ticker": "SPY",
+      "source": "saved with the pull",
+      "snapshot": "spy_chain_20261001T151531Z.parquet",
+      "interval": "1m",
+      "auto_adjust": false,
+      "date": "2026-10-01",
+      "first_bar": "2026-10-01T13:30:00+00:00",
+      "last_bar": "2026-10-01T15:15:00+00:00",
+      "row_count": 106
+    },
+    "spy_1m_20261002T151346Z.parquet": {
+      "utc_timestamp": "2026-10-02T15:32:30.453829+00:00",
+      "ticker": "SPY",
+      "source": "saved with the pull",
+      "snapshot": "spy_chain_20261002T151346Z.parquet",
+      "interval": "1m",
+      "auto_adjust": false,
+      "date": "2026-10-02",
+      "first_bar": "2026-10-02T13:30:00+00:00",
+      "last_bar": "2026-10-02T15:14:00+00:00",
+      "row_count": 105
     }
   },
   "curves": {
@@ -115,5 +261,15 @@
       "row_count": 10,
       "curve_date": "2026-09-29"
     }
+  },
+  "irx_closes": {
+    "utc_timestamp": "2026-10-02T15:32:21.556328+00:00",
+    "file": "irx_closes.csv",
+    "ticker": "^IRX",
+    "yfinance_version": "1.7.0",
+    "after_history": "2026-09-29",
+    "start_date": "2026-09-30",
+    "end_date": "2026-10-01",
+    "row_count": 2
   }
 }

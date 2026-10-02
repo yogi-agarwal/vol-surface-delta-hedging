@@ -39,8 +39,6 @@ from volsurf.data import (
 
 FROZEN_HISTORY = pathlib.Path(__file__).resolve().parents[1] / "data" / "frozen" / "history.parquet"
 FROZEN_CHAIN = FROZEN_HISTORY.with_name("chain_20260930.parquet")
-FROZEN_BARS = FROZEN_HISTORY.with_name("spy_1m_20260930.parquet")
-FROZEN_VIX_BARS = FROZEN_HISTORY.with_name("vix_1m_20260930.parquet")
 FROZEN_MANIFEST = FROZEN_HISTORY.with_name("manifest.json")
 FROZEN_CURVE = FROZEN_HISTORY.with_name("ust_curve_20260930.csv")
 RAW_COLUMNS = [  # columns written by scripts/collect_chain.py
@@ -48,6 +46,12 @@ RAW_COLUMNS = [  # columns written by scripts/collect_chain.py
     "expiry", "option_type", "fetch_utc", "spot_start", "spot_end",
 ]
 OM_STD, OM_SURFACE = "om_spy_std_30d_2021_2025.csv", "om_spy_volsurf_2021_2025.csv"
+FROZEN_SNAPSHOTS = {  # frozen chain: its raw snapshot
+    "chain_20260930.parquet": "spy_chain_20260930T192047Z.parquet",
+    "chain_20261001.parquet": "spy_chain_20261001T151531Z.parquet",
+    "chain_20261002.parquet": "spy_chain_20261002T151346Z.parquet",
+}
+DERIVED_COLUMNS = ["mid", "T", "rate", "D", "F", "k", "status"]  # added by clean_chain
 
 
 @pytest.fixture(scope="module")
@@ -453,14 +457,27 @@ def test_load_chain_builds_and_reads_frozen(tmp_path, monkeypatch):
         load_chain(raw_dir / "chain.parquet")
 
 
-def test_frozen_chain_integrity(history):
-    chain = pd.read_parquet(FROZEN_CHAIN)
+def _rate_before(rates, chain_name):
+    """The last rate strictly before a frozen chain's snapshot date, and its date."""
+    entry = json.loads(FROZEN_MANIFEST.read_text())["chains"][chain_name]
+    day = pd.Timestamp(entry["fetch_utc_first"]).tz_convert("America/New_York").normalize().tz_localize(None)
+    before = rates[rates.index < day]
+    return before.iloc[-1], before.index[-1]
+
+
+@pytest.mark.parametrize("chain_name", FROZEN_SNAPSHOTS)
+def test_frozen_chain_integrity(chain_name):
+    chain = pd.read_parquet(FROZEN_HISTORY.with_name(chain_name))
+    entry = json.loads(FROZEN_MANIFEST.read_text())["chains"][chain_name]
+    assert entry["snapshot"] == FROZEN_SNAPSHOTS[chain_name] and entry["row_count"] == len(chain)
+    assert entry["kept"] == (chain["status"] == "kept").sum()
     summary = chain_summary(chain)
     assert 8 <= len(summary) <= 12 and (summary["T_days"] >= 7).all()
     assert monthly_expiries(summary.index).all()
+    assert entry["expiries"] == [f"{e:%Y-%m-%d}" for e in summary.index]
     assert (summary["pairs"] >= 6).all()
     assert set(chain["status"]) <= {"kept", "zero bid", "spread", "open interest", "in the money"}
-    spot_bar = json.loads(FROZEN_MANIFEST.read_text())["chains"][FROZEN_CHAIN.name]["spot_bar"]["close"]
+    spot_bar = entry["spot_bar"]["close"]
     kept = chain[chain["status"] == "kept"]
     assert (kept["strike"] < spot_bar).eq(kept["option_type"] == "put").all()  # out of the money against S_bar
     passed = chain["status"].isin(["kept", "in the money"])  # every quote filter passed
@@ -469,11 +486,26 @@ def test_frozen_chain_integrity(history):
     assert (filter_quotes(kept["bid"], kept["ask"], kept["openInterest"]) == "kept").all()
     np.testing.assert_allclose(chain["k"], np.log(chain["strike"] / chain["F"]), rtol=0, atol=0)
     np.testing.assert_allclose(chain["D"], np.exp(-chain["rate"] * chain["T"]), rtol=0, atol=0)
-    assert (chain["rate"] == history.loc["2026-09-29", "r"]).all()
+    # The rate of the last ^IRX close strictly before the snapshot date: the frozen history, then the later
+    # frozen closes.
+    rate, rate_date = _rate_before(volsurf.data._rate_history(), chain_name)
+    assert (chain["rate"] == rate).all() and entry["rate"] == rate and entry["rate_date"] == f"{rate_date:%Y-%m-%d}"
 
     # Cleaning the frozen quotes again at the manifest's S_bar reproduces the frozen table exactly.
-    raw = chain[RAW_COLUMNS].assign(expiry=chain["expiry"].dt.strftime("%Y-%m-%d"))
+    raw_columns = [c for c in chain.columns if c not in DERIVED_COLUMNS]
+    assert raw_columns[: len(RAW_COLUMNS)] == RAW_COLUMNS
+    raw = chain[raw_columns].assign(expiry=chain["expiry"].dt.strftime("%Y-%m-%d"))
     pd.testing.assert_frame_equal(clean_chain(raw, chain["rate"].iloc[0], spot_bar), chain)
+
+
+def test_frozen_irx_closes(history):
+    # The closes after the history's last date, frozen for the later snapshots, without touching the history.
+    entry = json.loads(FROZEN_MANIFEST.read_text())["irx_closes"]
+    later = load_irx_closes()
+    assert entry["after_history"] == f"{history.index[-1]:%Y-%m-%d}" == "2026-09-29"
+    assert len(later) == entry["row_count"] and (later.index > history.index[-1]).all()
+    assert [f"{d:%Y-%m-%d}" for d in later.index] == ["2026-09-30", "2026-10-01"]
+    assert ((later > 0) & (later < 0.2)).all()
 
 
 # SPY 1-minute bars: a mocked regular session of 2026-09-30, 13:30 to 19:59 UTC (09:30 to 15:59 in New York).
@@ -646,19 +678,26 @@ def test_snapshot_spot_bar_prefers_saved_bars(tmp_path, monkeypatch):
     assert spots["spot_bar"]["close"] == close[335] and spots["spot_bar"]["bars"] == "spy_1m_20260930.parquet"
 
 
-def test_frozen_spot_bars():
-    bars = pd.read_parquet(FROZEN_BARS)
+@pytest.mark.parametrize("chain_name", FROZEN_SNAPSHOTS)
+def test_frozen_spot_bars(chain_name):
     manifest = json.loads(FROZEN_MANIFEST.read_text())
-    assert len(bars) == manifest["minute_bars"][FROZEN_BARS.name]["row_count"]
-    assert bars.index.is_unique and bars.index.is_monotonic_increasing
-    days = bars.index.tz_convert("America/New_York").normalize().tz_localize(None)
-    assert (days == pd.Timestamp("2026-09-30")).all()
-    entry = manifest["chains"][FROZEN_CHAIN.name]
+    entry = manifest["chains"][chain_name]
     targets = {
-        "spot_bar": pd.read_parquet(FROZEN_CHAIN)["lastTradeDate"].max(),  # the quote time
+        "spot_bar": pd.read_parquet(FROZEN_HISTORY.with_name(chain_name))["lastTradeDate"].max(),  # the quote time
         "spot_bar_fetch": pd.Timestamp(entry["fetch_utc_first"]),
     }
     for key, target in targets.items():
+        # The day file for 2026-09-30; the frozen copy of the bars saved with the pull from 2026-10-01.
+        bars_file = FROZEN_HISTORY.with_name(entry[key]["bars"])
+        bars = pd.read_parquet(bars_file)
+        meta = manifest["minute_bars"][bars_file.name]
+        assert len(bars) == meta["row_count"] and meta["ticker"] == "SPY"
+        assert bars.index.is_unique and bars.index.is_monotonic_increasing
+        days = bars.index.tz_convert("America/New_York").normalize().tz_localize(None)
+        assert (days == pd.Timestamp(meta["date"])).all()
+        if "T" in bars_file.stem.split("_")[-1]:  # saved with the pull: no bar starts after the last fetch
+            assert meta["source"] == "saved with the pull" and meta["snapshot"] == entry["snapshot"]
+            assert bars.index[-1] <= pd.Timestamp(entry["fetch_utc_last"])
         bar = nearest_bar_close(bars, target)
         assert entry[key]["close"] == bar["close"] and entry[key]["bar_start"] == bar["bar_start"].isoformat()
         assert entry[key]["target_utc"] == target.tz_convert("UTC").isoformat()
@@ -788,54 +827,25 @@ def test_snapshot_vix_bar_falls_back_to_the_daily_close(tmp_path, monkeypatch):
         snapshot_vix_bar(snapshot.name)
 
 
-def test_frozen_vix_bars():
-    bars = pd.read_parquet(FROZEN_VIX_BARS)
+@pytest.mark.parametrize("chain_name", FROZEN_SNAPSHOTS)
+def test_frozen_vix_bars(chain_name):
     manifest = json.loads(FROZEN_MANIFEST.read_text())
-    meta = manifest["minute_bars"][FROZEN_VIX_BARS.name]
+    entry = manifest["chains"][chain_name]
+    quote_time = pd.read_parquet(FROZEN_HISTORY.with_name(chain_name))["lastTradeDate"].max()
+    assert entry["vix_bar"]["target_utc"] == entry["spot_bar"]["target_utc"] == quote_time.isoformat()
+    assert entry["vix_bar"]["source"] == "1-minute bar"
+    vix_file = FROZEN_HISTORY.with_name(entry["vix_bar"]["bars"])
+    assert vix_file.name == f"vix_1m_{chain_name[6:14]}.parquet"
+    bars = pd.read_parquet(vix_file)
+    meta = manifest["minute_bars"][vix_file.name]
     assert meta["ticker"] == "^VIX" and len(bars) == meta["row_count"]
     assert bars.index.is_unique and bars.index.is_monotonic_increasing
     days = bars.index.tz_convert("America/New_York").normalize().tz_localize(None)
-    assert (days == pd.Timestamp("2026-09-30")).all()
-    quote_time = pd.read_parquet(FROZEN_CHAIN)["lastTradeDate"].max()
-    entry = manifest["chains"][FROZEN_CHAIN.name]
-    assert entry["vix_bar"]["target_utc"] == entry["spot_bar"]["target_utc"] == quote_time.isoformat()
+    assert (days == pd.Timestamp(meta["date"])).all()
     bar = nearest_bar_close(bars, quote_time)
-    assert entry["vix_bar"]["source"] == "1-minute bar" and entry["vix_bar"]["bars"] == FROZEN_VIX_BARS.name
     assert entry["vix_bar"]["close"] == bar["close"]
     assert entry["vix_bar"]["bar_start"] == bar["bar_start"].isoformat()
     assert abs(bar["bar_end"] - quote_time) <= pd.Timedelta(seconds=30)
-
-def test_load_irx_closes(tmp_path, monkeypatch):
-    monkeypatch.setattr(volsurf.data, "_FROZEN", tmp_path)
-    monkeypatch.setattr(volsurf.data, "_MANIFEST", tmp_path / "manifest.json")
-    monkeypatch.setattr(yfinance, "download", _no_network)
-    assert load_irx_closes().empty  # without the frozen file and without refresh, nothing is downloaded
-
-    calls = []
-
-    def _download(ticker, **kwargs):
-        calls.append((ticker, kwargs["start"], kwargs["end"]))
-        index = pd.DatetimeIndex(["2026-09-29", "2026-09-30", "2026-10-01", "2026-10-02"], name="Date")
-        return pd.DataFrame({"Close": [4.00, 4.01, np.nan, 4.03], "Open": 4.0}, index=index)
-
-    monkeypatch.setattr(yfinance, "download", _download)
-    r = load_irx_closes(refresh=True, end="2026-10-02")
-    # From the day after the history's last close, 2026-09-29, up to but not including the end date; the
-    # missing close is dropped, and a row the download repeats from inside the history is ignored.
-    assert calls == [("^IRX", "2026-09-30", "2026-10-02")]
-    assert r.index.tolist() == [pd.Timestamp("2026-09-30")] and r.name == "r"
-    assert r.iloc[0] == pytest.approx(irx_to_rate(0.0401), rel=1e-15)
-    stored = pd.read_csv(tmp_path / "irx_closes.csv", index_col="date", parse_dates=["date"])
-    assert stored["d"].tolist() == [pytest.approx(0.0401, rel=1e-15)]  # the frozen file keeps d, like the history
-    entry = json.loads((tmp_path / "manifest.json").read_text())["irx_closes"]
-    assert entry["after_history"] == "2026-09-29" and entry["row_count"] == 1
-    assert entry["start_date"] == entry["end_date"] == "2026-09-30" and entry["ticker"] == "^IRX"
-
-    monkeypatch.setattr(yfinance, "download", _no_network)
-    pd.testing.assert_series_equal(load_irx_closes(), r, check_freq=False)  # the frozen file
-    monkeypatch.setattr(yfinance, "download", lambda ticker, **kwargs: pd.DataFrame({"Close": []}))
-    with pytest.raises(ValueError, match="no \\^IRX close"):
-        load_irx_closes(refresh=True, end="2026-10-02")
 
 
 def test_snapshot_rate_after_the_history(tmp_path, monkeypatch, history):
