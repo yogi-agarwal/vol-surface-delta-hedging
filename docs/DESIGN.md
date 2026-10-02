@@ -17,6 +17,7 @@ Values marked (verified) were reproduced independently in Python (NumPy 2.4, Sci
 | 2c | Implied vol solver, no-IV filter, Newton demo: Figure 1 | stage-2c |
 | 3 | SVI calibration: Figure 2, Table 2 | stage-3 |
 | 4 | Arbitrage checks, constrained refit, variance-swap bridge: Figures 3 to 5, Table 3 | stage-4 |
+| Stability | The pipeline on three snapshots, the stability table and the choice of primary (section 5) | stability |
 | 6 | Write-up and fresh-install reproducibility check | v1.0 |
 
 The hedging track goes first because it needs only pricing and historical data.
@@ -134,6 +135,23 @@ Primary snapshot (decision 2026-10-02, fixed before any result of the new snapsh
 - Eligible: the snapshots whose 1-minute bars were saved at pull time, 2026-10-01 (spy_chain_20261001T151531Z) and 2026-10-02 (spy_chain_20261002T151346Z). The 2026-09-30 snapshot, whose bars were downloaded after the pull, is reported alongside but is not eligible.
 - Rule: the primary is the eligible snapshot with the lower median relative bid-ask spread (ask - bid)/mid over its near-the-money kept quotes. These are the contracts with status kept in the frozen chain (after the Stage 2b filters and the out-of-the-money selection, before the Stage 2c no-IV filter), over every selected expiry pooled, with |ln(K/S)| ≤ 0.05 and S the snapshot's spot quote spot_start, as in the fit bands above. Equal medians go to the later snapshot.
 - The surface sections of the notebook (Stage 2b to Stage 4 and Figures 1 to 5) use the primary through the SNAPSHOT constant.
+
+Stability check across snapshots (decisions 2026-10-02)
+- Every snapshot runs the same pipeline: Stage 2b cleaning, the Stage 2c implied vols and no-IV filter, the Stage 3 SVI fits, the Stage 4 constrained refit with its certification grid, and the bridge. Each cleaned chain is frozen to data/frozen/chain_YYYYMMDD.parquet with its manifest entry, and every DESIGN.md acceptance value of Stages 2b to 4 holds on every snapshot, each asserted by a frozen-data test.
+- Rate: the last ^IRX close strictly before the snapshot date, as above. The frozen history ends on 2026-09-29, and refreshing it would add windows and change every Stage 5 result. The later closes the new snapshots need (2026-09-30 and 2026-10-01) are therefore frozen separately in data/frozen/irx_closes.csv, as the discount yield d with a manifest entry, and converted with irx_to_rate. history.parquet is unchanged, and the 2026-09-30 snapshot keeps its 2026-09-29 rate.
+- D is the flat ^IRX rate on every snapshot, so the snapshots differ in their quotes, not in the method. The Table 1b comparison and its rule are printed for the primary only. If the rule would make the Treasury curve the default on the primary, the work stops for a decision.
+- Spot bars: the 1-minute bars saved with a pull are frozen into data/frozen/ under their pull-time names (spy_1m_YYYYMMDDTHHMMSSZ.parquet), with manifest entries, when load_chain builds the chain from them. snapshot_spot_bar reads the bars saved with the pull in data/raw/ first, then that frozen copy, then the frozen day file, so a fresh install reproduces spot_bar from data/frozen/ alone.
+- VIX at the quote time comes from each snapshot day's ^VIX 1-minute bars, frozen as in section 8. The 2026-10-02 day was frozen during the session, at 15:26 UTC, and ends at its last bar then (recorded in the manifest), after that snapshot's quote time.
+- Stability table, one row per snapshot:
+  - quote time in Chicago time (the latest option trade in the cleaned chain);
+  - spot_bar;
+  - the number of expiries and of contracts kept (Stage 2b);
+  - the median near-the-money relative spread of the primary rule;
+  - the parity share within the combined half-spread, pooled over the fit pairs of every expiry, as Table 1 prints it;
+  - the mean and the maximum over slices of the near-the-money RMSE after the refit, in vol points;
+  - the violations after the refit on the certification grid, summed over both checks, both regions and every slice;
+  - the 30-day variance-swap vol, the 30-day ATM vol and their gap, VIX at the quote time, and VIX minus the variance-swap vol, all as in section 8.
+- Then the primary rule is applied as a computed line, next to a check that SNAPSHOT is the snapshot it picks.
 
 ## 6. Implied vol (Stage 2c)
 - brentq on [0.001, 5.0] with xtol 1e-14, after checking for a sign change; otherwise return NaN and count the contract under "no IV" in Table 1. A price outside the strict no-arbitrage bounds, D·max(F - K, 0) < C < D·F for a call and D·max(K - F, 0) < P < D·K for a put, also returns NaN.
