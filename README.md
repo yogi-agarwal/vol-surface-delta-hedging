@@ -1,5 +1,7 @@
 # vol-surface-delta-hedging
 
+[![CI](https://github.com/yogi-agarwal/vol-surface-delta-hedging/actions/workflows/ci.yml/badge.svg)](https://github.com/yogi-agarwal/vol-surface-delta-hedging/actions/workflows/ci.yml)
+
 SPY implied volatility surface construction and delta-hedging P&L attribution.
 
 **Status:** Complete
@@ -84,4 +86,4 @@ python3.12 -m venv .venv
 .venv/bin/python -m jupyter nbconvert --to notebook --execute --inplace notebooks/analysis.ipynb
 ```
 
-The pins in `requirements.txt` were frozen and tested on Windows. Two of them, colorama and pywinpty, carry a Windows-only marker. pip finds a wheel for every other pin on Linux (manylinux_2_28, x86_64) and on macOS 14 (arm64), and also installs pexpect and ptyprocess there (and appnope on macOS), which the Windows freeze does not pin. The macOS and Linux installs themselves have not been run.
+The pins in `requirements.txt` were frozen on Windows. colorama and pywinpty are pinned for Windows only, pexpect and ptyprocess for every other platform, and appnope for macOS only. CI runs the macOS and Linux installs: on every push and pull request it installs the requirements, runs the tests and executes the notebook on Ubuntu and macOS with Python 3.12, where the OptionMetrics section skips.
