@@ -1,4 +1,4 @@
-"""Static arbitrage checks of an SVI surface (DESIGN.md section 8).
+"""Static arbitrage checks of an SVI surface, its constrained refit and the variance-swap bridge (DESIGN.md section 8).
 
 Butterfly: a slice w(k) of total implied variance against log-moneyness
 k = ln(K/F) is free of butterfly arbitrage when Gatheral and Jacquier's
@@ -17,18 +17,29 @@ w_{i+1}(k) >= w_i(k) for consecutive expiries.
 The checks run on grids over k in [-2, 1]: 201 points constrain the refit,
 the 6,001-point fine grid feeds its exchange rounds, and 60,001 points
 certify the result. A margin below -1e-12 counts as a violation, inside the
-quoted range and in the extrapolated region separately.
+quoted range and in the extrapolated region separately. refit_surface refits
+the slices in order of expiry under these constraints.
+
+Bridge: the variance-swap total variance of a slice is 2·∫ OTM(K)/K dk
+by replication with out-of-the-money options (forward prices per unit of strike),
+cross-checked by Gatheral's z-integral over the full range and by the CBOE
+discrete formula over quoted strikes. A 30-day slice comes from linear
+interpolation of w in T at fixed k between the bracketing expiries.
 
 Units: k and w are dimensionless (w is a decimal variance times years), T
 is in years and implied vols are decimals.
 """
 
+import math
 from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import minimize, minimize_scalar
+from scipy.integrate import quad
+from scipy.optimize import brentq, minimize, minimize_scalar
+from scipy.stats import norm
 
+from volsurf.black_scholes import black76_price
 from volsurf.svi import (
     S_MIN,
     SVIFit,
@@ -51,6 +62,9 @@ _MAX_ROUNDS = 10  # exchange rounds of the refit after its first solve
 _MINIMISER_XTOL = 1e-12  # tolerance in k of the bounded search for a margin minimum between fine-grid points
 _SLSQP_OPTIONS = {"ftol": 1e-15, "maxiter": 1000}
 _SLSQP_RUNS = 3  # SLSQP is restarted from its own point when it reports failure, at most this many runs in all
+T_BRIDGE = 30 / 365  # maturity of the variance-swap bridge, years
+_QUAD_LIMIT, _QUAD_EPSABS, _QUAD_EPSREL = 1000, 1e-15, 1e-13  # adaptive quadrature of the bridge
+_Z_MAX = 12.0  # Gatheral's z-integral runs over [-12, 12]
 
 
 def k_grid(n):
@@ -518,3 +532,238 @@ def refit_restarts(k, w, weights, previous=None, tol=VIOLATION_TOL):
         except RuntimeError:
             results.append(None)
     return results
+
+
+def bracket(T, T_slices):
+    """The consecutive slices that bracket a maturity, and the weight of the later one.
+
+    Parameters
+    ----------
+    T : float
+        Maturity in years, with T_slices[0] <= T <= T_slices[-1].
+    T_slices : array_like
+        Maturities of the slices in years, strictly increasing.
+
+    Returns
+    -------
+    i, j : int
+        Indices with j = i + 1 and T_slices[i] <= T <= T_slices[j].
+    lam : float
+        (T - T_i)/(T_j - T_i), so w(T) = (1 - lam)·w_i + lam·w_j.
+
+    Raises
+    ------
+    ValueError
+        If T_slices is not strictly increasing with at least two entries, or
+        T lies outside [T_slices[0], T_slices[-1]].
+    """
+    T_slices = np.asarray(T_slices, dtype=float)
+    if T_slices.ndim != 1 or T_slices.size < 2 or not (np.diff(T_slices) > 0).all():
+        raise ValueError("T_slices must be strictly increasing, with at least two slices")
+    if not T_slices[0] <= T <= T_slices[-1]:
+        raise ValueError(f"T = {T} lies outside the slices, [{T_slices[0]}, {T_slices[-1]}]")
+    i = min(int(np.searchsorted(T_slices, T, side="right")) - 1, T_slices.size - 2)
+    return i, i + 1, float((T - T_slices[i]) / (T_slices[i + 1] - T_slices[i]))
+
+
+def interpolate_w(k, T, T_slices, params):
+    """Total variance between SVI slices, linear in T at fixed k (DESIGN.md section 8).
+
+    w(k, T) = (1 - lam)·w_i(k) + lam·w_{i+1}(k) with lam = (T - T_i)/(T_{i+1} - T_i)
+    for the bracketing slices (bracket). Interpolating total variance at
+    fixed k keeps the calendar order of the slices: where w_{i+1} >= w_i,
+    w rises with T between them.
+
+    Parameters
+    ----------
+    k : array_like
+        Log-moneyness.
+    T : float or array_like
+        Maturities in years inside [T_slices[0], T_slices[-1]]; broadcast
+        against k.
+    T_slices : array_like
+        Maturities of the slices in years, strictly increasing.
+    params : sequence of (a, b, rho, m, s)
+        Raw SVI parameters of each slice, in the order of T_slices.
+
+    Returns
+    -------
+    ndarray
+        w(k, T), the broadcast shape of k and T.
+
+    Raises
+    ------
+    ValueError
+        As for bracket, or if params and T_slices differ in length.
+    """
+    T_slices = np.asarray(T_slices, dtype=float)
+    if len(params) != T_slices.size:
+        raise ValueError("params and T_slices must have one entry per slice")
+    k, T = np.broadcast_arrays(np.asarray(k, dtype=float), np.asarray(T, dtype=float))
+    if T.size:
+        bracket(float(T.min()), T_slices)
+        bracket(float(T.max()), T_slices)
+    i = np.minimum(np.searchsorted(T_slices, T, side="right") - 1, T_slices.size - 2)
+    lam = (T - T_slices[i]) / (T_slices[i + 1] - T_slices[i])
+    slices = np.stack([raw_svi(k, *p[:5]) for p in params])  # (n_slices, *shape)
+    w_i = np.take_along_axis(slices, i[None], axis=0)[0]
+    w_j = np.take_along_axis(slices, (i + 1)[None], axis=0)[0]
+    return (1.0 - lam) * w_i + lam * w_j
+
+
+def otm_per_strike(k, w):
+    """Out-of-the-money Black-76 forward price per unit of strike, OTM(K)/K with F = 1.
+
+    The put for k < 0 and the call for k >= 0, undiscounted, at strike
+    K = F·e^k and total variance w, divided by K: N(-d_-) - e^(-k)·N(-d_+)
+    for the put and e^(-k)·N(d_+) - N(d_-) for the call, with
+    d_± = -k/√w ± √w/2. The terms with e^(-k) are taken through
+    log N, so the deep wings neither overflow nor lose their scale. The
+    replication integrand of variance_swap_replication is twice this.
+
+    Parameters
+    ----------
+    k : array_like
+        Log-moneyness ln(K/F).
+    w : array_like
+        Total implied variance at k, > 0.
+
+    Returns
+    -------
+    ndarray
+        OTM(K)/K, dimensionless, the broadcast shape of k and w.
+    """
+    k, w = np.broadcast_arrays(np.asarray(k, dtype=float), np.asarray(w, dtype=float))
+    root = np.sqrt(w)
+    d_plus = -k / root + 0.5 * root
+    d_minus = d_plus - root
+    out = np.empty(k.shape)
+    put = k < 0  # each side only where it applies, so e^(-k) never meets the other wing
+    out[put] = norm.cdf(-d_minus[put]) - np.exp(-k[put] + norm.logcdf(-d_plus[put]))
+    out[~put] = np.exp(-k[~put] + norm.logcdf(d_plus[~put])) - norm.cdf(d_minus[~put])
+    return out[()]
+
+
+def variance_swap_replication(w, k_lo=-np.inf, k_hi=np.inf):
+    """Variance-swap total variance by replication with out-of-the-money options, in forward terms.
+
+    σ²_VS·T = 2·∫ OTM(K)/K² dK with forward prices. With K = F·e^k this is
+    2·∫ (OTM(K)/K) dk over k = ln(K/F) (otm_per_strike). The integral runs
+    over [k_lo, k_hi] by adaptive quadrature (scipy.integrate.quad), split at
+    k = 0, where the integrand has a kink. The full range gives the model's
+    variance swap; a finite range truncates it, as the VIX does at the last
+    quoted strikes.
+
+    Parameters
+    ----------
+    w : callable
+        Total implied variance as a function of k (vectorised or scalar).
+    k_lo, k_hi : float
+        Integration range in k, k_lo < k_hi; infinite by default.
+
+    Returns
+    -------
+    float
+        σ²_VS·T (decimal variance times years); the vol is √(σ²_VS·T / T).
+    """
+    if not k_lo < k_hi:
+        raise ValueError("the range needs k_lo < k_hi")
+
+    def integrand(k):
+        return 2.0 * float(otm_per_strike(k, w(k)))
+
+    pieces = [(k_lo, min(k_hi, 0.0)), (max(k_lo, 0.0), k_hi)]
+    return float(sum(quad(integrand, lo, hi, limit=_QUAD_LIMIT, epsabs=_QUAD_EPSABS, epsrel=_QUAD_EPSREL)[0]
+                     for lo, hi in pieces if lo < hi))
+
+
+def _d_minus(k, w):
+    """d_-(k) = -k/√w - √w/2 of a slice w(k)."""
+    root = np.sqrt(w(k))
+    return -k / root - 0.5 * root
+
+
+def variance_swap_z_integral(w):
+    """Full-range variance-swap total variance by Gatheral's z-integral.
+
+    σ²_VS·T = ∫ φ(z)·w(k(z)) dz, with φ the standard normal density and k(z)
+    the inverse of z = d_-(k) = -k/√w - √w/2, which falls from +∞ to -∞ as k
+    rises on a slice free of butterfly arbitrage. z runs over [-12, 12],
+    where φ leaves out less than 1e-32; k(z) comes from brentq. The map is
+    checked to fall on 20,001 points between k(12) and k(-12).
+
+    Parameters
+    ----------
+    w : callable
+        Total implied variance as a function of k (vectorised).
+
+    Returns
+    -------
+    float
+        σ²_VS·T.
+
+    Raises
+    ------
+    ValueError
+        If d_- does not fall in k over the range.
+    """
+
+    def k_of(z):
+        lo, hi = -1.0, 1.0
+        while _d_minus(lo, w) < z:
+            lo *= 2.0
+        while _d_minus(hi, w) > z:
+            hi *= 2.0
+        return brentq(lambda k: _d_minus(k, w) - z, lo, hi, xtol=1e-15, rtol=4 * np.finfo(float).eps)
+
+    k_hi, k_lo = k_of(-_Z_MAX), k_of(_Z_MAX)
+    if not (np.diff(_d_minus(np.linspace(k_lo, k_hi, 20001), w)) < 0).all():
+        raise ValueError("d_-(k) must fall as k rises; the slice is not free of butterfly arbitrage")
+    value, _ = quad(lambda z: math.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi) * float(w(k_of(z))),
+                    -_Z_MAX, _Z_MAX, points=[0.0], limit=_QUAD_LIMIT, epsabs=_QUAD_EPSABS, epsrel=_QUAD_EPSREL)
+    return float(value)
+
+
+def vix_discrete_variance(k_nodes, w):
+    """Variance-swap total variance by the CBOE discrete formula, in forward terms.
+
+    σ²·T = 2·Σ Δx_j/x_j²·Q(x_j) - (1/x_0 - 1)², with x = K/F = e^k at the
+    nodes in increasing order, Q the out-of-the-money forward price per unit
+    of F at w (puts below x_0, calls above, and the mean of the put and the
+    call at x_0), x_0 the largest node at or below 1, and Δx_j half the
+    distance between the neighbours of node j (the distance to the one
+    neighbour at the ends). The last term corrects for splitting puts from
+    calls at x_0 rather than at the forward.
+
+    Parameters
+    ----------
+    k_nodes : array_like
+        Log-moneyness of the strikes, at least two distinct, one at or
+        below 0; duplicates are dropped.
+    w : callable
+        Total implied variance as a function of k (vectorised).
+
+    Returns
+    -------
+    float
+        σ²·T over the nodes.
+
+    Raises
+    ------
+    ValueError
+        With fewer than two distinct nodes or none at or below k = 0.
+    """
+    x = np.unique(np.exp(np.asarray(k_nodes, dtype=float)))
+    if x.size < 2 or x[0] > 1.0:
+        raise ValueError("the formula needs two distinct nodes, one of them at or below the forward")
+    k = np.log(x)
+    root = np.sqrt(w(k))
+    put = black76_price(1.0, x, 1.0, 1.0, root, is_call=False)
+    call = black76_price(1.0, x, 1.0, 1.0, root, is_call=True)
+    i0 = int(np.flatnonzero(x <= 1.0)[-1])
+    q = np.where(np.arange(x.size) < i0, put, call)
+    q[i0] = 0.5 * (put[i0] + call[i0])
+    dx = np.empty_like(x)
+    dx[0], dx[-1] = x[1] - x[0], x[-1] - x[-2]
+    dx[1:-1] = 0.5 * (x[2:] - x[:-2])
+    return float(2.0 * np.sum(dx / x**2 * q) - (1.0 / x[i0] - 1.0) ** 2)

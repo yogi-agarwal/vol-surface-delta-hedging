@@ -5,26 +5,33 @@ from decimal import Decimal
 import numpy as np
 import pandas as pd
 import pytest
-from scipy.integrate import quad
+from scipy.integrate import quad, simpson
 
 from volsurf.arbitrage import (
     N_CERTIFY,
     N_FINE,
     N_REFIT,
+    T_BRIDGE,
     VIOLATION_TOL,
     RefitResult,
     _g_and_jacobian,
     _inner_parts,
     _margin_minimisers,
     arbitrage_table,
+    bracket,
     butterfly_g,
+    interpolate_w,
     k_grid,
+    otm_per_strike,
     refit_restarts,
     refit_slice,
     refit_surface,
     svi_density,
     svi_derivatives,
+    variance_swap_replication,
+    variance_swap_z_integral,
     violation_counts,
+    vix_discrete_variance,
 )
 from volsurf.black_scholes import black76_price
 from volsurf.implied_vol import black76_implied_vol
@@ -335,3 +342,170 @@ def test_frozen_refit_restarts(frozen_surface):
         assert solved
         assert min(r.fit.objective for r in solved) >= result.fit.objective - CROSS_CHECK_TOL
         previous = result.fit[:5]
+
+
+# DESIGN section 8 (verified): the test slice's variance-swap vol, 14.9647% by replication and by Gatheral's
+# z-integral, against ATM 13.6770%; printed to 4 decimals in percent, so each holds to 5e-7 in vol.
+DESIGN_VS, DESIGN_ATM, PRINTED_HALF_UNIT = 0.149647, 0.136770, 5e-7
+VIX_CHECK_TOL = 1e-4  # DESIGN section 8: the discrete formula agrees with the replication within 0.01 vol points
+
+
+def _design_w(k):
+    return raw_svi(k, *DESIGN_SLICE)
+
+
+def _simpson_truncated(w, k_lo, k_hi, n=2_000_001):
+    """2·∫ OTM(K)/K dk over [k_lo, k_hi] by composite Simpson, n points on each side of k = 0.
+
+    Built from black76_price, independently of otm_per_strike and of adaptive quadrature.
+    """
+    total = 0.0
+    for lo, hi, is_call in ((k_lo, 0.0, False), (0.0, k_hi, True)):
+        k = np.linspace(lo, hi, n)
+        K = np.exp(k)
+        price = black76_price(1.0, K, 1.0, 1.0, np.sqrt(w(k)), is_call=is_call)
+        total += simpson(2.0 * price / K, x=k)
+    return total
+
+
+def test_bracket():
+    T = [0.1, 0.2, 0.5]
+    assert bracket(0.15, T) == (0, 1, pytest.approx(0.5, abs=1e-15))
+    assert bracket(0.1, T) == (0, 1, 0.0) and bracket(0.5, T) == (1, 2, 1.0)
+    assert bracket(0.2, T) == (1, 2, 0.0)  # on a slice, the later pair
+    with pytest.raises(ValueError, match="outside"):
+        bracket(0.6, T)
+    with pytest.raises(ValueError, match="strictly increasing"):
+        bracket(0.15, [0.1, 0.1, 0.5])
+
+
+def test_interpolate_w():
+    T_slices = [DESIGN_T, LATER_T, 0.5]
+    params = [DESIGN_SLICE, LATER, (0.004, 0.02, -0.4, 0.0, 0.1)]
+    k = np.linspace(-0.3, 0.2, 11)
+    for T, p in zip(T_slices, params):  # each slice at its own maturity
+        np.testing.assert_allclose(interpolate_w(k, T, T_slices, params), raw_svi(k, *p), rtol=1e-15, atol=0)
+    # Linear in T at fixed k between the bracketing slices.
+    T = DESIGN_T + 0.3 * (LATER_T - DESIGN_T)
+    expected = 0.7 * raw_svi(k, *DESIGN_SLICE) + 0.3 * raw_svi(k, *LATER)
+    np.testing.assert_allclose(interpolate_w(k, T, T_slices, params), expected, rtol=1e-14, atol=0)
+    # Vectorised over a (T, k) grid, and calendar order is kept where the slices are ordered.
+    grid_T = np.linspace(DESIGN_T, 0.5, 25)[:, None]
+    surface = interpolate_w(k[None, :], grid_T, T_slices, params)
+    assert surface.shape == (25, 11)
+    np.testing.assert_allclose(surface[7], interpolate_w(k, grid_T[7, 0], T_slices, params), rtol=1e-15, atol=0)
+    ordered = (np.diff(np.stack([raw_svi(k, *p) for p in params]), axis=0) >= 0).all(axis=0)
+    assert ordered.any() and (np.diff(surface[:, ordered], axis=0) >= 0).all()
+    with pytest.raises(ValueError, match="outside"):
+        interpolate_w(k, 0.6, T_slices, params)
+    with pytest.raises(ValueError, match="one entry per slice"):
+        interpolate_w(k, 0.2, T_slices, params[:2])
+
+
+def test_otm_per_strike():
+    k = np.array([-0.4, -0.05, 0.0, 0.05, 0.3])
+    w = _design_w(k)
+    K = np.exp(k)
+    expected = black76_price(1.0, K, 1.0, 1.0, np.sqrt(w), is_call=k >= 0) / K
+    np.testing.assert_allclose(otm_per_strike(k, w), expected, rtol=1e-11, atol=1e-16)
+    # Deep in the wings it stays finite and non-negative instead of overflowing.
+    deep = otm_per_strike(np.array([-60.0, 40.0]), np.array([1.2, 0.8]))
+    assert np.isfinite(deep).all() and (deep >= 0).all() and deep.max() < 1e-6
+    assert otm_per_strike(0.0, 0.04) == pytest.approx(float(black76_price(1.0, 1.0, 1.0, 1.0, 0.2)), rel=1e-14)
+
+
+def test_variance_swap_design_values():
+    # DESIGN section 8 (verified): 14.9647% by replication and by the z-integral against ATM 13.6770%.
+    replication = math.sqrt(variance_swap_replication(_design_w) / DESIGN_T)
+    z_integral = math.sqrt(variance_swap_z_integral(_design_w) / DESIGN_T)
+    atm = math.sqrt(_design_w(0.0) / DESIGN_T)
+    print(f"variance-swap vol {100 * replication:.6f}% by replication, {100 * z_integral:.6f}% by the z-integral, "
+          f"ATM {100 * atm:.6f}%")
+    for value, printed in ((replication, DESIGN_VS), (z_integral, DESIGN_VS), (atm, DESIGN_ATM)):
+        assert abs(value - printed) <= PRINTED_HALF_UNIT
+    assert replication == pytest.approx(z_integral, rel=1e-12)
+
+
+def test_variance_swap_of_a_flat_smile():
+    # With a flat smile the variance swap is the implied variance itself.
+    flat = lambda k: np.full(np.shape(k), 0.2**2 * 0.5)  # noqa: E731
+    assert variance_swap_replication(flat) == pytest.approx(0.02, rel=1e-12)
+    assert variance_swap_z_integral(flat) == pytest.approx(0.02, rel=1e-12)
+
+
+def test_truncated_replication():
+    # The truncated integral agrees with an independent high-resolution quadrature on the DESIGN slice,
+    # and lies below the full-range value.
+    truncated = variance_swap_replication(_design_w, -0.3, 0.1)
+    reference = _simpson_truncated(_design_w, -0.3, 0.1)
+    print(f"truncated on [-0.3, 0.1]: {truncated:.15e} by quad, {reference:.15e} by Simpson")
+    assert abs(truncated - reference) <= 1e-12
+    assert truncated < variance_swap_replication(_design_w)
+    assert variance_swap_replication(_design_w, -0.3, -0.1) < truncated  # a narrower range, one side only
+    with pytest.raises(ValueError, match="k_lo < k_hi"):
+        variance_swap_replication(_design_w, 0.1, -0.3)
+
+
+def test_z_integral_rejects_butterfly_arbitrage():
+    # A steep right wing on a level near 0: d_-(k) turns upwards just right of the vertex.
+    steep = (1e-4, 1.0, 0.9, 0.3, 0.01)
+    with pytest.raises(ValueError, match="d_-"):
+        variance_swap_z_integral(lambda k: raw_svi(k, *steep))
+
+
+def test_vix_discrete_variance():
+    # Three nodes by hand: the put at 0.9, the mean of the put and the call at 1 and the call at 1.1.
+    w = 0.2**2 * 0.25
+    flat = lambda k: np.full(np.shape(k), w)  # noqa: E731
+    sigma = math.sqrt(w)
+    put, atm, call = (float(black76_price(1.0, x, 1.0, 1.0, sigma, is_call=c))
+                      for x, c in ((0.9, False), (1.0, True), (1.1, True)))
+    by_hand = 2 * (0.1 / 0.81 * put + 0.1 * atm + 0.1 / 1.21 * call)
+    assert vix_discrete_variance(np.log([1.1, 0.9, 1.0, 1.0]), flat) == pytest.approx(by_hand, rel=1e-14)
+    # x_0 below the forward: the correction term (1/x_0 - 1)² enters.
+    nodes = np.log([0.9, 0.98, 1.06])
+    put_098 = float(black76_price(1.0, 0.98, 1.0, 1.0, sigma, is_call=False))
+    call_098 = float(black76_price(1.0, 0.98, 1.0, 1.0, sigma, is_call=True))
+    call_106 = float(black76_price(1.0, 1.06, 1.0, 1.0, sigma, is_call=True))
+    expected = 2 * (0.08 / 0.81 * put + 0.08 / 0.98**2 * 0.5 * (put_098 + call_098)
+                    + 0.08 / 1.06**2 * call_106) - (1 / 0.98 - 1) ** 2
+    assert vix_discrete_variance(nodes, flat) == pytest.approx(expected, rel=1e-13)
+    # On the DESIGN slice it converges to the truncated replication as the strikes get denser.
+    truncated = math.sqrt(variance_swap_replication(_design_w, -0.3, 0.1) / DESIGN_T)
+    for step, tol in ((1e-3, VIX_CHECK_TOL), (1e-4, 1e-6)):
+        nodes = np.linspace(-0.3, 0.1, round(0.4 / step) + 1)
+        discrete = math.sqrt(vix_discrete_variance(nodes, _design_w) / DESIGN_T)
+        print(f"strike step {step:g} in k: discrete minus replication {discrete - truncated:+.2e} in vol")
+        assert abs(discrete - truncated) <= tol
+    with pytest.raises(ValueError, match="two distinct nodes"):
+        vix_discrete_variance([0.0, 0.0], flat)
+    with pytest.raises(ValueError, match="at or below the forward"):
+        vix_discrete_variance([0.01, 0.02], flat)
+
+
+def test_frozen_bridge(frozen_surface):
+    # DESIGN section 8 on the 2026-09-30 snapshot: the 30-day slice from the refitted bracketing expiries,
+    # over the intersection of their quoted ranges. The CBOE discrete formula at the quoted strikes of both
+    # expiries agrees with the replication within 0.01 vol points; the truncated value lies below the
+    # full-range one, and the full range agrees by replication and by the z-integral.
+    T, quotes = frozen_surface["T"], frozen_surface["quotes"]
+    params = [r.fit[:5] for r in frozen_surface["refits"]]
+    i, j, lam = bracket(T_BRIDGE, T)
+    assert [f"{frozen_surface['expiries'][n]:%Y-%m-%d}" for n in (i, j)] == ["2026-10-16", "2026-11-20"]
+    k_lo, k_hi = max(quotes[i][0].min(), quotes[j][0].min()), min(quotes[i][0].max(), quotes[j][0].max())
+
+    def w30(k):
+        return interpolate_w(k, T_BRIDGE, T, params)
+
+    truncated = variance_swap_replication(w30, k_lo, k_hi)
+    nodes = np.concatenate([quotes[n][0] for n in (i, j)])
+    nodes = nodes[(nodes >= k_lo) & (nodes <= k_hi)]
+    discrete = vix_discrete_variance(nodes, w30)
+    vol, vol_discrete = math.sqrt(truncated / T_BRIDGE), math.sqrt(discrete / T_BRIDGE)
+    full = variance_swap_replication(w30)
+    print(f"30-day slice, lam = {lam:.4f}, k in [{k_lo:.4f}, {k_hi:.4f}], {np.unique(nodes).size} strikes: "
+          f"discrete minus replication {100 * (vol_discrete - vol):+.4f} vol points")
+    assert abs(vol_discrete - vol) <= VIX_CHECK_TOL
+    assert truncated < full
+    assert math.sqrt(full / T_BRIDGE) == pytest.approx(math.sqrt(variance_swap_z_integral(w30) / T_BRIDGE),
+                                                       rel=1e-8)
