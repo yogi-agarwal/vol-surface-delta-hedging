@@ -70,6 +70,7 @@ _MINIMISER_XTOL = 1e-12  # tolerance in k of the bounded search for a margin min
 _SLSQP_OPTIONS = {"ftol": 1e-15, "maxiter": 1000}
 _SLSQP_RUNS = 3  # SLSQP is restarted from its own point when it reports failure, at most this many runs in all
 _SLSQP_LINESEARCH = 8  # SLSQP exit mode "Positive directional derivative for linesearch"
+_RESTART_TOL = 1e-10  # refit_surface takes a restart only when it beats the solve from the Stage 3 fit by more on f
 T_BRIDGE = 30 / 365  # maturity of the variance-swap bridge, years
 _QUAD_LIMIT, _QUAD_EPSABS, _QUAD_EPSREL = 1000, 1e-15, 1e-13  # adaptive quadrature of the bridge
 _Z_MAX = 12.0  # Gatheral's z-integral runs over [-12, 12]
@@ -263,12 +264,16 @@ class RefitResult(NamedTuple):
     added : ndarray
         The points added to the 201 constraint points by the exchange
         rounds: fine-grid points and minimisers of a margin between them.
+    from_restart : bool
+        True when refit_surface took the solve from one of the nine Stage 3
+        outer starts instead of the solve from the Stage 3 fit.
     """
 
     fit: SVIFit
     refitted: bool
     rounds: int
     added: np.ndarray
+    from_restart: bool = False
 
 
 def _inner_parts(k, p):
@@ -511,6 +516,12 @@ def refit_slice(k, w, weights, start, previous=None, force=False, tol=VIOLATION_
 def refit_surface(slices, starts, tol=VIOLATION_TOL):
     """Refit SVI slices in order of expiry, shortest first, each against the previous refit.
 
+    Each slice is refitted with refit_slice from its Stage 3 fit. A slice
+    that the refit changes is also solved from the nine Stage 3 outer starts
+    (refit_restarts), and the solve from the Stage 3 fit is kept unless it
+    raised or the best converged restart is lower by more than 1e-10 on f;
+    then that restart is kept, flagged from_restart (DESIGN.md section 8).
+
     Parameters
     ----------
     slices : sequence of (k, w, weights)
@@ -524,15 +535,39 @@ def refit_surface(slices, starts, tol=VIOLATION_TOL):
     -------
     list of RefitResult
         One per slice, in the given order.
+
+    Raises
+    ------
+    RuntimeError
+        If the refit of a slice raises from its Stage 3 fit and from every
+        outer start.
     """
     if len(slices) != len(starts):
         raise ValueError("slices and starts must have one entry per slice")
     results, previous = [], None
     for (k, w, weights), start in zip(slices, starts):
-        result = refit_slice(k, w, weights, start, previous, tol=tol)
+        result = _best_refit(k, w, weights, start, previous, tol)
         results.append(result)
         previous = result.fit[:5]
     return results
+
+
+def _best_refit(k, w, weights, start, previous, tol):
+    """The refit of one slice from its Stage 3 fit, or the best restart when that raised or is beaten (refit_surface)."""
+    error = None
+    try:
+        result = refit_slice(k, w, weights, start, previous, tol=tol)
+    except RuntimeError as err:
+        result, error = None, err
+    if result is not None and not result.refitted:
+        return result  # the Stage 3 minimiser meets every constraint
+    restarts = [r for r in refit_restarts(k, w, weights, previous, tol) if r is not None]
+    best = min(restarts, key=lambda r: r.fit.objective, default=None)
+    if result is not None and (best is None or best.fit.objective >= result.fit.objective - _RESTART_TOL):
+        return result
+    if best is None:
+        raise RuntimeError("the constrained refit failed from the Stage 3 fit and from every outer start") from error
+    return best._replace(from_restart=True)
 
 
 def refit_restarts(k, w, weights, previous=None, tol=VIOLATION_TOL):

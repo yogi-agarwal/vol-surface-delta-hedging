@@ -403,6 +403,41 @@ def test_frozen_refit_restarts(snapshot_surface):
         previous = result.fit[:5]
 
 
+# Seeds of few-ulp perturbations of the 2026-10-01 market total variances on which, on Windows, the solve from
+# the Stage 3 fit alone raised (6, 23 and 29) or converged above the best restart by more than 1e-10 (13 and 28).
+PERTURBATION_SEEDS = (6, 13, 23, 28, 29)
+
+
+@pytest.mark.parametrize("seed", PERTURBATION_SEEDS)
+def test_refit_holds_under_few_ulp_perturbations(seed):
+    # DESIGN section 8: floating-point results differ between platforms in the last bits, so the 2026-10-01
+    # refit is rerun with every market total variance moved by a whole number of ulp drawn from [-4, 4], slice
+    # by slice in order of T, and every acceptance check must hold: no violation on the certification grid,
+    # the Stage 3 constraints, m in the quoted range and near-the-money RMSE under 1 vol point on every slice.
+    chain = pd.read_parquet(FROZEN_CHAIN.with_name("chain_20261001.parquet"))
+    kept = chain[chain["status"] == "kept"]
+    kept = kept.assign(iv=black76_implied_vol(
+        kept["mid"], kept["F"], kept["strike"], kept["T"], kept["D"], kept["option_type"] == "call"
+    )).dropna(subset=["iv"])
+    rng = np.random.default_rng(seed)
+    quotes, fits, T = [], [], []
+    for _, rows in kept.groupby("expiry"):
+        rows = rows.sort_values("k")
+        k, w = rows["k"].to_numpy(), (rows["iv"] ** 2 * rows["T"]).to_numpy()
+        w = w * (1.0 + rng.integers(-4, 5, size=w.size) * 2.0**-52)
+        weights = vega_weights(rows["F"], rows["strike"], rows["T"], rows["D"], rows["iv"])
+        quotes.append((k, w, weights))
+        fits.append(fit_svi(k, w, weights))
+        T.append(float(rows["T"].iloc[0]))
+    refits = refit_surface(quotes, fits)
+    assert len(refits) == 12
+    params = [r.fit[:5] for r in refits]
+    for (k, w, _), T_slice, result, previous in zip(quotes, T, refits, [None, *params[:-1]]):
+        _assert_clean(result.fit, k, previous)
+        assert svi_fit_errors(k, w, T_slice, result.fit).rmse_near < NEAR_TARGET
+    print(f"seed {seed}: restart taken on {sum(r.from_restart for r in refits)} of 12 slices")
+
+
 # DESIGN section 8 (verified): the test slice's variance-swap vol, 14.9647% by replication and by Gatheral's
 # z-integral, against ATM 13.6770%; printed to 4 decimals in percent, so each holds to 5e-7 in vol.
 DESIGN_VS, DESIGN_ATM, PRINTED_HALF_UNIT = 0.149647, 0.136770, 5e-7
